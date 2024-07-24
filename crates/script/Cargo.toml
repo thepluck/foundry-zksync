@@ -23,6 +23,8 @@ foundry-debugger.workspace = true
 foundry-cheatcodes.workspace = true
 foundry-wallets.workspace = true
 foundry-linking.workspace = true
+foundry-zksync-core.workspace = true
+foundry-zksync-compiler.workspace = true
 
 serde.workspace = true
 eyre.workspace = true
@@ -53,6 +55,9 @@ alloy-dyn-abi.workspace = true
 alloy-primitives.workspace = true
 alloy-eips.workspace = true
 alloy-transport.workspace = true
+
+# zksync
+zksync-web3-rs.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

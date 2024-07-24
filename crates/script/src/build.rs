@@ -16,11 +16,13 @@ use foundry_compilers::{
     artifacts::{BytecodeObject, Libraries},
     compilers::{multi::MultiCompilerLanguage, Language},
     info::ContractInfo,
+    solc::SolcLanguage,
     utils::source_files_iter,
     ArtifactId, ProjectCompileOutput,
 };
-use foundry_evm::{constants::DEFAULT_CREATE2_DEPLOYER, traces::debug::ContractSources};
+use foundry_evm::constants::DEFAULT_CREATE2_DEPLOYER;
 use foundry_linking::Linker;
+use foundry_zksync_compiler::DualCompiledContracts;
 use std::{path::PathBuf, str::FromStr, sync::Arc};
 
 /// Container for the compiled contracts.
@@ -32,6 +34,7 @@ pub struct BuildData {
     pub output: ProjectCompileOutput,
     /// ID of target contract artifact.
     pub target: ArtifactId,
+    pub dual_compiled_contracts: Option<DualCompiledContracts>,
 }
 
 impl BuildData {
@@ -195,6 +198,27 @@ impl PreprocessedState {
             .files(sources_to_compile)
             .compile(&project)?;
 
+        // ZK
+        let dual_compiled_contracts = if script_config.config.zksync.should_compile() {
+            let zk_project = foundry_zksync_compiler::create_project(
+                &script_config.config,
+                script_config.config.cache,
+                false,
+            )?;
+            let sources_to_compile =
+                source_files_iter(project.paths.sources.as_path(), SolcLanguage::FILE_EXTENSIONS)
+                    .chain([target_path.to_path_buf()]);
+
+            let zk_compiler =
+                ProjectCompiler::new().quiet_if(args.opts.silent).files(sources_to_compile);
+
+            let zk_output = zk_compiler
+                .zksync_compile(&zk_project, script_config.config.zksync.avoid_contracts())?;
+            Some(DualCompiledContracts::new(&output, &zk_output, &project.paths))
+        } else {
+            None
+        };
+
         let mut target_id: Option<ArtifactId> = None;
 
         // Find target artfifact id by name and path in compilation artifacts.
@@ -233,7 +257,12 @@ impl PreprocessedState {
             args,
             script_config,
             script_wallets,
-            build_data: BuildData { output, target, project_root: project.root().clone() },
+            build_data: BuildData {
+                output,
+                target,
+                project_root: project.root().clone(),
+                dual_compiled_contracts,
+            },
         })
     }
 }

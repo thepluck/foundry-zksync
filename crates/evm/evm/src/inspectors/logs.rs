@@ -45,6 +45,7 @@ impl<DB: Database> Inspector<DB> for LogCollector {
         self.logs.push(log.clone());
     }
 
+    #[inline]
     fn call(
         &mut self,
         _context: &mut EvmContext<DB>,

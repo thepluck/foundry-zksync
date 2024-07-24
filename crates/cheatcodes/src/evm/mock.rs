@@ -1,42 +1,7 @@
 use crate::{Cheatcode, Cheatcodes, CheatsCtxt, DatabaseExt, Result, Vm::*};
 use alloy_primitives::{Address, Bytes, U256};
+use foundry_cheatcodes_common::mock::{MockCallDataContext, MockCallReturnData};
 use revm::{interpreter::InstructionResult, primitives::Bytecode};
-use std::cmp::Ordering;
-
-/// Mocked call data.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub struct MockCallDataContext {
-    /// The partial calldata to match for mock
-    pub calldata: Bytes,
-    /// The value to match for mock
-    pub value: Option<U256>,
-}
-
-/// Mocked return data.
-#[derive(Clone, Debug)]
-pub struct MockCallReturnData {
-    /// The return type for the mocked call
-    pub ret_type: InstructionResult,
-    /// Return data or error
-    pub data: Bytes,
-}
-
-impl PartialOrd for MockCallDataContext {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for MockCallDataContext {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // Calldata matching is reversed to ensure that a tighter match is
-        // returned if an exact match is not found. In case, there is
-        // a partial match to calldata that is more specific than
-        // a match to a msg.value, then the more specific calldata takes
-        // precedence.
-        self.calldata.cmp(&other.calldata).reverse().then(self.value.cmp(&other.value).reverse())
-    }
-}
 
 impl Cheatcode for clearMockedCallsCall {
     fn apply(&self, state: &mut Cheatcodes) -> Result {
@@ -57,6 +22,9 @@ impl Cheatcode for mockCall_0Call {
         if empty_bytecode {
             let code = Bytecode::new_raw(Bytes::from_static(&[0u8]));
             ccx.ecx.journaled_state.set_code(*callee, code);
+
+        if ccx.state.use_zk_vm {
+            foundry_zksync_core::cheatcodes::set_mocked_account(*callee, ccx.ecx, ccx.caller);
         }
 
         mock_call(ccx.state, callee, data, None, returnData, InstructionResult::Return);

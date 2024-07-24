@@ -666,6 +666,8 @@ impl TestKind {
 
 #[derive(Clone, Debug, Default)]
 pub struct TestSetup {
+    /// Deployments generated during the setup
+    pub deployments: HashMap<Address, Bytes>,
     /// The address at which the test contract was deployed
     pub address: Address,
     /// The logs emitted during setup
@@ -707,6 +709,7 @@ impl TestSetup {
     }
 
     pub fn success(
+        deployments: HashMap<Address, Bytes>,
         address: Address,
         logs: Vec<Log>,
         traces: Traces,
@@ -714,7 +717,20 @@ impl TestSetup {
         coverage: Option<HitMaps>,
         fuzz_fixtures: FuzzFixtures,
     ) -> Self {
+<<<<<<< HEAD
         Self { address, logs, traces, labeled_addresses, reason: None, coverage, fuzz_fixtures }
+=======
+        Self {
+            deployments,
+            address,
+            logs,
+            traces,
+            labeled_addresses,
+            reason: None,
+            coverage,
+            fuzz_fixtures,
+        }
+>>>>>>> dev
     }
 
     pub fn failed_with(
@@ -724,6 +740,7 @@ impl TestSetup {
         reason: String,
     ) -> Self {
         Self {
+            deployments: HashMap::new(),
             address: Address::ZERO,
             logs,
             traces,

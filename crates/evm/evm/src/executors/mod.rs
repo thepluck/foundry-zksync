@@ -31,6 +31,7 @@ use revm::{
         BlockEnv, Bytecode, Env, EnvWithHandlerCfg, ExecutionResult, Output, ResultAndState,
         SpecId, TxEnv, TxKind,
     },
+    Database,
 };
 use std::{borrow::Cow, collections::HashMap};
 
@@ -82,14 +83,22 @@ pub struct Executor {
     gas_limit: u64,
     /// Whether `failed()` should be called on the test contract to determine if the test failed.
     legacy_assertions: bool,
+
+        /// Sets up the next transaction to be executed as a ZK transaction.
+        zk_tx: Option<ZkTransactionMetadata>,
+        // simulate persisted factory deps
+        zk_persisted_factory_deps: HashMap<foundry_zksync_core::H256, Vec<u8>>,
+    
+        pub use_zk: bool,
+    }
 }
 
 impl Executor {
-    /// Creates a new `ExecutorBuilder`.
-    #[inline]
-    pub fn builder() -> ExecutorBuilder {
-        ExecutorBuilder::new()
-    }
+        /// Creates a new `ExecutorBuilder`.
+        #[inline]
+        pub fn builder() -> ExecutorBuilder {
+            ExecutorBuilder::new()
+        }
 
     /// Creates a new `Executor` with the given arguments.
     #[inline]
@@ -187,6 +196,10 @@ impl Executor {
         let mut account = self.backend().basic_ref(address)?.unwrap_or_default();
         account.balance = amount;
         self.backend_mut().insert_account_info(address, account);
+        if self.use_zk {
+            let (address, slot) = foundry_zksync_core::state::get_balance_storage(address);
+            self.backend.insert_account_storage(address, slot, amount)?;
+        }
         Ok(())
     }
 
@@ -200,6 +213,15 @@ impl Executor {
         let mut account = self.backend().basic_ref(address)?.unwrap_or_default();
         account.nonce = nonce;
         self.backend_mut().insert_account_info(address, account);
+        if self.use_zk {
+            let (address, slot) = foundry_zksync_core::state::get_nonce_storage(address);
+            // fetch the full nonce to preserve account's deployment nonce
+            let full_nonce = self.backend.storage(address, slot)?;
+            let full_nonce = foundry_zksync_core::state::parse_full_nonce(full_nonce);
+            let new_full_nonce =
+                foundry_zksync_core::state::new_full_nonce(nonce, full_nonce.deploy_nonce);
+            self.backend.insert_account_storage(address, slot, new_full_nonce)?;
+        }
         Ok(())
     }
 
@@ -211,6 +233,11 @@ impl Executor {
     /// Returns `true` if the account has no code.
     pub fn is_empty_code(&self, address: Address) -> BackendResult<bool> {
         Ok(self.backend().basic_ref(address)?.map(|acc| acc.is_empty_code_hash()).unwrap_or(true))
+    }
+
+    /// Returns `true` if the account has no code.
+    pub fn is_empty_code(&self, address: Address) -> DatabaseResult<bool> {
+        Ok(self.backend.basic_ref(address)?.map(|acc| acc.is_empty_code_hash()).unwrap_or(true))
     }
 
     #[inline]
@@ -527,6 +554,8 @@ impl Executor {
                 return false;
             }
         }
+        success
+    }
 
         if !self.legacy_assertions {
             return true;
@@ -728,6 +757,7 @@ pub struct RawCallResult {
 impl Default for RawCallResult {
     fn default() -> Self {
         Self {
+            deployments: HashMap::new(),
             exit_reason: InstructionResult::Continue,
             reverted: false,
             has_snapshot_failure: false,
@@ -865,6 +895,7 @@ fn convert_executed_result(
         .filter(|txs| !txs.is_empty());
 
     Ok(RawCallResult {
+        deployments: HashMap::new(),
         exit_reason,
         reverted: !matches!(exit_reason, return_ok!()),
         has_snapshot_failure,

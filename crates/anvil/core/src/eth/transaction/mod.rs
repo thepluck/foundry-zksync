@@ -357,6 +357,33 @@ pub fn to_alloy_transaction_with_hash_and_sender(
             max_fee_per_blob_gas: None,
             blob_versioned_hashes: None,
             other: Default::default(),
+        },
+        TypedTransaction::EIP4844(t) => RpcTransaction {
+            hash,
+            nonce: t.tx().tx().nonce,
+            block_hash: None,
+            block_number: None,
+            transaction_index: None,
+            from,
+            to: None,
+            value: t.tx().tx().value,
+            gas_price: Some(t.tx().tx().max_fee_per_gas),
+            max_fee_per_gas: Some(t.tx().tx().max_fee_per_gas),
+            max_priority_fee_per_gas: Some(t.tx().tx().max_priority_fee_per_gas),
+            gas: t.tx().tx().gas_limit,
+            input: t.tx().tx().input.clone(),
+            chain_id: Some(t.tx().tx().chain_id),
+            signature: Some(RpcSignature {
+                r: t.signature().r(),
+                s: t.signature().s(),
+                v: U256::from(t.signature().v().y_parity_byte()),
+                y_parity: Some(alloy_rpc_types::Parity::from(t.signature().v().y_parity())),
+            }),
+            access_list: Some(t.tx().tx().access_list.clone()),
+            transaction_type: Some(3),
+            max_fee_per_blob_gas: Some(t.tx().tx().max_fee_per_blob_gas),
+            blob_versioned_hashes: Some(t.tx().tx().blob_versioned_hashes.clone()),
+            other: Default::default(),
             authorization_list: None,
         },
         TypedTransaction::EIP4844(t) => RpcTransaction {
@@ -484,8 +511,8 @@ impl PendingTransaction {
     pub fn to_revm_tx_env(&self) -> TxEnv {
         fn transact_to(kind: &TxKind) -> TxKind {
             match kind {
-                TxKind::Call(c) => TxKind::Call(*c),
-                TxKind::Create => TxKind::Create,
+                TxKind::Call(c) => TransactTo::Call(*c),
+                TxKind::Create => TransactTo::Create,
             }
         }
 
@@ -530,7 +557,7 @@ impl PendingTransaction {
                     gas_price: U256::from(*gas_price),
                     gas_priority_fee: None,
                     gas_limit: *gas_limit as u64,
-                    access_list: access_list.clone().into(),
+                    access_list: access_list.flattened(),
                     ..Default::default()
                 }
             }
@@ -557,7 +584,7 @@ impl PendingTransaction {
                     gas_price: U256::from(*max_fee_per_gas),
                     gas_priority_fee: Some(U256::from(*max_priority_fee_per_gas)),
                     gas_limit: *gas_limit as u64,
-                    access_list: access_list.clone().into(),
+                    access_list: access_list.flattened(),
                     ..Default::default()
                 }
             }
@@ -578,7 +605,7 @@ impl PendingTransaction {
                 } = tx.tx().tx();
                 TxEnv {
                     caller,
-                    transact_to: TxKind::Call(*to),
+                    transact_to: TransactTo::call(*to),
                     data: input.clone(),
                     chain_id: Some(*chain_id),
                     nonce: Some(*nonce),
@@ -588,7 +615,7 @@ impl PendingTransaction {
                     max_fee_per_blob_gas: Some(U256::from(*max_fee_per_blob_gas)),
                     blob_hashes: blob_versioned_hashes.clone(),
                     gas_limit: *gas_limit as u64,
-                    access_list: access_list.clone().into(),
+                    access_list: access_list.flattened(),
                     ..Default::default()
                 }
             }
@@ -617,6 +644,7 @@ impl PendingTransaction {
                     gas_limit: *gas_limit as u64,
                     access_list: access_list.clone().into(),
                     authorization_list: Some(authorization_list.clone().into()),
+                    access_list: access_list.flattened(),
                     ..Default::default()
                 }
             }
@@ -774,7 +802,7 @@ impl TypedTransaction {
                 input: t.tx().input.clone(),
                 nonce: t.tx().nonce,
                 gas_limit: t.tx().gas_limit,
-                gas_price: Some(t.tx().gas_price),
+                gas_price: Some(U256::from(t.tx().gas_price)),
                 max_fee_per_gas: None,
                 max_priority_fee_per_gas: None,
                 max_fee_per_blob_gas: None,
@@ -788,7 +816,7 @@ impl TypedTransaction {
                 input: t.tx().input.clone(),
                 nonce: t.tx().nonce,
                 gas_limit: t.tx().gas_limit,
-                gas_price: Some(t.tx().gas_price),
+                gas_price: Some(U256::from(t.tx().gas_price)),
                 max_fee_per_gas: None,
                 max_priority_fee_per_gas: None,
                 max_fee_per_blob_gas: None,
@@ -803,8 +831,8 @@ impl TypedTransaction {
                 nonce: t.tx().nonce,
                 gas_limit: t.tx().gas_limit,
                 gas_price: None,
-                max_fee_per_gas: Some(t.tx().max_fee_per_gas),
-                max_priority_fee_per_gas: Some(t.tx().max_priority_fee_per_gas),
+                max_fee_per_gas: Some(U256::from(t.tx().max_fee_per_gas)),
+                max_priority_fee_per_gas: Some(U256::from(t.tx().max_priority_fee_per_gas)),
                 max_fee_per_blob_gas: None,
                 blob_versioned_hashes: None,
                 value: t.tx().value,
@@ -816,10 +844,10 @@ impl TypedTransaction {
                 input: t.tx().tx().input.clone(),
                 nonce: t.tx().tx().nonce,
                 gas_limit: t.tx().tx().gas_limit,
-                gas_price: Some(t.tx().tx().max_fee_per_blob_gas),
-                max_fee_per_gas: Some(t.tx().tx().max_fee_per_gas),
-                max_priority_fee_per_gas: Some(t.tx().tx().max_priority_fee_per_gas),
-                max_fee_per_blob_gas: Some(t.tx().tx().max_fee_per_blob_gas),
+                gas_price: Some(U256::from(t.tx().tx().max_fee_per_blob_gas)),
+                max_fee_per_gas: Some(U256::from(t.tx().tx().max_fee_per_gas)),
+                max_priority_fee_per_gas: Some(U256::from(t.tx().tx().max_priority_fee_per_gas)),
+                max_fee_per_blob_gas: Some(U256::from(t.tx().tx().max_fee_per_blob_gas)),
                 blob_versioned_hashes: Some(t.tx().tx().blob_versioned_hashes.clone()),
                 value: t.tx().tx().value,
                 chain_id: Some(t.tx().tx().chain_id),
@@ -1181,10 +1209,10 @@ pub struct TransactionEssentials {
     pub input: Bytes,
     pub nonce: u64,
     pub gas_limit: u128,
-    pub gas_price: Option<u128>,
-    pub max_fee_per_gas: Option<u128>,
-    pub max_priority_fee_per_gas: Option<u128>,
-    pub max_fee_per_blob_gas: Option<u128>,
+    pub gas_price: Option<U256>,
+    pub max_fee_per_gas: Option<U256>,
+    pub max_priority_fee_per_gas: Option<U256>,
+    pub max_fee_per_blob_gas: Option<U256>,
     pub blob_versioned_hashes: Option<Vec<B256>>,
     pub value: U256,
     pub chain_id: Option<u64>,

@@ -426,6 +426,14 @@ impl<'a> InvariantExecutor<'a> {
                 progress.inc(1);
             }
 
+            // Revert state to not persist values between runs.
+            fuzz_state.revert();
+
+            // If running with progress then increment completed runs.
+            if let Some(progress) = progress {
+                progress.inc(1);
+            }
+
             Ok(())
         });
 

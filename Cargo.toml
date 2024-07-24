@@ -26,10 +26,10 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.0.2"
 edition = "2021"
 # Remember to update clippy.toml as well
-rust-version = "1.79"
+rust-version = "1.76"
 authors = ["Foundry Contributors"]
 license = "MIT OR Apache-2.0"
 homepage = "https://github.com/foundry-rs/foundry"
@@ -136,10 +136,11 @@ forge = { path = "crates/forge" }
 forge-doc = { path = "crates/doc" }
 forge-fmt = { path = "crates/fmt" }
 forge-verify = { path = "crates/verify" }
-forge-script = { path = "crates/script" }
+forge-script = { path = "crates/script" }   
 forge-sol-macro-gen = { path = "crates/sol-macro-gen" }
 foundry-cheatcodes = { path = "crates/cheatcodes" }
 foundry-cheatcodes-spec = { path = "crates/cheatcodes/spec" }
+foundry-cheatcodes-common = { path = "crates/cheatcodes/common" }
 foundry-cli = { path = "crates/cli" }
 foundry-common = { path = "crates/common" }
 foundry-common-fmt = { path = "crates/common/fmt" }
@@ -155,18 +156,24 @@ foundry-macros = { path = "crates/macros" }
 foundry-test-utils = { path = "crates/test-utils" }
 foundry-wallets = { path = "crates/wallets" }
 foundry-linking = { path = "crates/linking" }
+foundry-zksync-core = { path = "crates/zksync/core" }
+foundry-zksync-compiler = { path = "crates/zksync/compiler" }
 
 # solc & compilation utilities
-foundry-block-explorers = { version = "0.5.1", default-features = false }
-foundry-compilers = { version = "0.10.0", default-features = false }
+# foundry-block-explorers = { version = "0.4.1", default-features = false }
+# foundry-compilers = { version = "0.8.0", default-features = false }
+foundry-block-explorers = { git = "https://github.com/Moonsong-Labs/block-explorers", branch = "zksync-v0.5.1", default-features = false }
+foundry-compilers = { git = "https://github.com/Moonsong-Labs/compilers", branch = "zksync-v0.10.0" }
 foundry-fork-db = "0.2"
 solang-parser = "=0.3.3"
 
 ## revm
 # no default features to avoid c-kzg
-revm = { version = "12.1.0", default-features = false }
-revm-primitives = { version = "7.1.0", default-features = false }
-revm-inspectors = { version = "0.5", features = ["serde"] }
+revm = { version = "9.0.0", default-features = false }
+revm-primitives = { version = "4.0.0", default-features = false }
+revm-inspectors = { git = "https://github.com/paradigmxyz/revm-inspectors", rev = "4fe17f0", features = [
+    "serde",
+] }
 
 ## ethers
 ethers-contract-abigen = { version = "2.0.14", default-features = false }
@@ -206,6 +213,17 @@ syn-solidity = "0.7.7"
 alloy-chains = "0.1"
 alloy-rlp = "0.3.3"
 alloy-trie = "0.4.1"
+
+## zksync
+era_test_node = { git="https://github.com/matter-labs/era-test-node.git" , rev = "1d72eae6e9400b5b6caed5e60093e7c32eee8abb" }
+zksync-web3-rs = {git = "https://github.com/lambdaclass/zksync-web3-rs.git", rev = "fd7adf634c016f40ea01f702e0e05f57aa5ba614"}
+zksync_basic_types = { git = "https://github.com/matter-labs/zksync-era.git", rev = "e10bbdd1e863962552f37e768ae6af649353e4ea" }
+zksync_types = { git = "https://github.com/matter-labs/zksync-era.git", rev = "e10bbdd1e863962552f37e768ae6af649353e4ea" }
+zksync_state = { git = "https://github.com/matter-labs/zksync-era.git", rev = "e10bbdd1e863962552f37e768ae6af649353e4ea" }
+multivm = { git = "https://github.com/matter-labs/zksync-era.git", rev = "e10bbdd1e863962552f37e768ae6af649353e4ea" }
+zksync_web3_decl = { git = "https://github.com/matter-labs/zksync-era.git", rev = "e10bbdd1e863962552f37e768ae6af649353e4ea" }
+zksync_utils = { git = "https://github.com/matter-labs/zksync-era.git", rev = "e10bbdd1e863962552f37e768ae6af649353e4ea" }
+zksync_contracts = { git = "https://github.com/matter-labs/zksync-era.git", rev = "e10bbdd1e863962552f37e768ae6af649353e4ea" }
 
 ## misc
 async-trait = "0.1"
@@ -260,7 +278,42 @@ reqwest = { version = "0.12", default-features = false }
 tower = "0.4"
 tower-http = "0.5"
 # soldeer
-soldeer = "0.2.19"
+soldeer = "0.2.15"
 
 proptest = "1"
 comfy-table = "7"
+
+[patch.crates-io]
+revm = { git = "https://github.com/bluealloy/revm.git", rev = "41e2f7f" }
+revm-interpreter = { git = "https://github.com/bluealloy/revm.git", rev = "41e2f7f" }
+revm-precompile = { git = "https://github.com/bluealloy/revm.git", rev = "41e2f7f" }
+revm-primitives = { git = "https://github.com/bluealloy/revm.git", rev = "41e2f7f" }
+
+# revm-interpreter = { path = "../revm/crates/interpreter" }
+# revm-primitives = { path = "../revm/crates/primitives" }
+# revm = { path = "../revm/crates/revm" }
+# revm-precompile = { path = "../revm/crates/precompile" }
+# revm-test = { path = "../revm/bins/revm-test" }
+# revme = { path = "../revm/bins/revme" }
+
+# NOTE: Uncomment this if overriding revm above
+# [patch."https://github.com/bluealloy/revm"]
+# revm = { path = "../revm/crates/revm" }
+
+# [patch."https://github.com/matter-labs/era-test-node"]
+# era_test_node = { path = "../era-test-node" }
+
+# [patch."https://github.com/Moonsong-Labs/compilers"]
+# foundry-compilers = { path = "../compilers/crates/compilers/" }
+
+# [patch."https://github.com/matter-labs/era-boojum"]
+# cs_derive = { git = "https://github.com/nbaztec/era-boojum", branch = "foundry-fix" }
+# boojum = { git = "https://github.com/nbaztec/era-boojum", branch = "foundry-fix" }
+
+# [patch."https://github.com/moonsong-labs/compilers"]
+# foundry-compilers = { path = "../msl-compilers/crates/compilers" }
+# foundry-compilers-core = { path = "../msl-compilers/crates/core" }
+# foundry-compilers-artifacts-vyper = { path = "../msl-compilers/crates/artifacts/vyper" }
+# foundry-compilers-artifacts-solc = { path = "../msl-compilers/crates/artifacts/solc" }
+# foundry-compilers-artifacts-zksolc = { path = "../msl-compilers/crates/artifacts/zksolc" }
+# foundry-compilers-artifacts = { path = "../msl-compilers/crates/artifacts/artifacts" }

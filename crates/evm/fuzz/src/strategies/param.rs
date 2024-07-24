@@ -9,8 +9,11 @@ const MAX_ARRAY_LEN: usize = 256;
 /// Given a parameter type, returns a strategy for generating values for that type.
 ///
 /// See [`fuzz_param_with_fixtures`] for more information.
-pub fn fuzz_param(param: &DynSolType) -> BoxedStrategy<DynSolValue> {
-    fuzz_param_inner(param, None)
+pub fn fuzz_param(
+    param: &DynSolType,
+    no_zksync_reserved_addresses: bool,
+) -> BoxedStrategy<DynSolValue> {
+    fuzz_param_inner(param, None, no_zksync_reserved_addresses)
 }
 
 /// Given a parameter type and configured fixtures for param name, returns a strategy for generating
@@ -31,13 +34,15 @@ pub fn fuzz_param_with_fixtures(
     param: &DynSolType,
     fixtures: Option<&[DynSolValue]>,
     name: &str,
+    no_zksync_reserved_addresses: bool,
 ) -> BoxedStrategy<DynSolValue> {
-    fuzz_param_inner(param, fixtures.map(|f| (f, name)))
+    fuzz_param_inner(param, fixtures.map(|f| (f, name)), no_zksync_reserved_addresses)
 }
 
 fn fuzz_param_inner(
     param: &DynSolType,
     mut fuzz_fixtures: Option<(&[DynSolValue], &str)>,
+    no_zksync_reserved_addresses: bool,
 ) -> BoxedStrategy<DynSolValue> {
     if let Some((fixtures, name)) = fuzz_fixtures {
         if !fixtures.iter().all(|f| f.matches(param)) {
@@ -65,7 +70,18 @@ fn fuzz_param_inner(
     };
 
     match *param {
-        DynSolType::Address => value(),
+        DynSolType::Address => value()
+            .prop_map(move |value| match value.as_address() {
+                Some(addr) => {
+                    if no_zksync_reserved_addresses {
+                        DynSolValue::Address(foundry_zksync_core::to_safe_address(addr))
+                    } else {
+                        DynSolValue::Address(addr)
+                    }
+                }
+                None => value,
+            })
+            .boxed(),
         DynSolType::Int(n @ 8..=256) => super::IntStrategy::new(n, fuzz_fixtures)
             .prop_map(move |x| DynSolValue::Int(x, n))
             .boxed(),
@@ -84,20 +100,22 @@ fn fuzz_param_inner(
             .boxed(),
         DynSolType::Tuple(ref params) => params
             .iter()
-            .map(|param| fuzz_param_inner(param, None))
+            .map(|param| fuzz_param_inner(param, None, no_zksync_reserved_addresses))
             .collect::<Vec<_>>()
             .prop_map(DynSolValue::Tuple)
             .boxed(),
-        DynSolType::FixedArray(ref param, size) => {
-            proptest::collection::vec(fuzz_param_inner(param, None), size)
-                .prop_map(DynSolValue::FixedArray)
-                .boxed()
-        }
-        DynSolType::Array(ref param) => {
-            proptest::collection::vec(fuzz_param_inner(param, None), 0..MAX_ARRAY_LEN)
-                .prop_map(DynSolValue::Array)
-                .boxed()
-        }
+        DynSolType::FixedArray(ref param, size) => proptest::collection::vec(
+            fuzz_param_inner(param, None, no_zksync_reserved_addresses),
+            size,
+        )
+        .prop_map(DynSolValue::FixedArray)
+        .boxed(),
+        DynSolType::Array(ref param) => proptest::collection::vec(
+            fuzz_param_inner(param, None, no_zksync_reserved_addresses),
+            0..MAX_ARRAY_LEN,
+        )
+        .prop_map(DynSolValue::Array)
+        .boxed(),
         _ => panic!("unsupported fuzz param type: {param}"),
     }
 }
@@ -110,6 +128,8 @@ pub fn fuzz_param_from_state(
     param: &DynSolType,
     state: &EvmFuzzState,
 ) -> BoxedStrategy<DynSolValue> {
+    let no_zksync_reserved_addresses = state.dictionary_read().no_zksync_reserved_addresses();
+
     // Value strategy that uses the state.
     let value = || {
         let state = state.clone();
@@ -128,9 +148,16 @@ pub fn fuzz_param_from_state(
 
     // Convert the value based on the parameter type
     match *param {
-        DynSolType::Address => {
-            value().prop_map(move |value| DynSolValue::Address(Address::from_word(value))).boxed()
-        }
+        DynSolType::Address => value()
+            .prop_map(move |value| {
+                let addr = Address::from_word(value);
+                if no_zksync_reserved_addresses {
+                    DynSolValue::Address(foundry_zksync_core::to_safe_address(addr))
+                } else {
+                    DynSolValue::Address(addr)
+                }
+            })
+            .boxed(),
         DynSolType::Function => value()
             .prop_map(move |value| {
                 DynSolValue::Function(alloy_primitives::Function::from_word(value))
@@ -216,9 +243,9 @@ mod tests {
         let f = "testArray(uint64[2] calldata values)";
         let func = get_func(f).unwrap();
         let db = CacheDB::new(EmptyDB::default());
-        let state = EvmFuzzState::new(&db, FuzzDictionaryConfig::default());
+        let state = EvmFuzzState::new(&db, FuzzDictionaryConfig::default(), false);
         let strat = proptest::prop_oneof![
-            60 => fuzz_calldata(func.clone(), &FuzzFixtures::default()),
+            60 => fuzz_calldata(func.clone(), &FuzzFixtures::default(), false),
             40 => fuzz_calldata_from_state(func, &state),
         ];
         let cfg = proptest::test_runner::Config { failure_persistence: None, ..Default::default() };

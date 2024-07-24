@@ -17,8 +17,10 @@ pub const CHEATCODE_CONTRACT_HASH: B256 =
 
 /// The Hardhat console address.
 ///
-/// See: <https://github.com/nomiclabs/hardhat/blob/master/packages/hardhat-core/console.sol>
-pub const HARDHAT_CONSOLE_ADDRESS: Address = address!("000000000000000000636F6e736F6c652e6c6f67");
+/// This is calculated as:
+/// `keccak256(abi.encodePacked(CHEATCODE_ADDRESS))`.
+pub const CHEATCODE_CONTRACT_HASH: B256 =
+    b256!("b0450508e5a2349057c3b4c9c84524d62be4bb17e565dbe2df34725a26872291");
 
 /// Stores the caller address to be used as *sender* account for:
 /// - deploying Test contracts

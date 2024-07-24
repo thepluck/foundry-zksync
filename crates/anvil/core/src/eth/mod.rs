@@ -11,6 +11,7 @@ use alloy_rpc_types::{
     },
     BlockId, BlockNumberOrTag as BlockNumber, Filter, Index,
 };
+use alloy_rpc_types_trace::geth::{GethDebugTracingOptions, GethDefaultTracingOptions};
 use alloy_serde::WithOtherFields;
 
 pub mod block;
@@ -147,7 +148,7 @@ pub enum EthRequest {
     EthGetProof(Address, Vec<B256>, Option<BlockId>),
 
     /// The sign method calculates an Ethereum specific signature with:
-    #[cfg_attr(feature = "serde", serde(rename = "eth_sign"))]
+    #[cfg_attr(feature = "serde", serde(rename = "eth_sign", alias = "personal_sign"))]
     EthSign(Address, Bytes),
 
     /// The sign method calculates an Ethereum specific signature, equivalent to eth_sign:

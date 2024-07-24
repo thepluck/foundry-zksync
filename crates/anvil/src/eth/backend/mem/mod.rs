@@ -32,24 +32,29 @@ use crate::{
     revm::{db::DatabaseRef, primitives::AccountInfo},
     NodeConfig, PrecompileFactory,
 };
-use alloy_consensus::{Account, Header, Receipt, ReceiptWithBloom};
+use alloy_consensus::{Header, Receipt, ReceiptWithBloom};
 use alloy_eips::eip4844::MAX_BLOBS_PER_BLOCK;
 use alloy_primitives::{keccak256, Address, Bytes, TxHash, TxKind, B256, U256, U64};
 use alloy_rpc_types::{
-    anvil::Forking,
-    request::TransactionRequest,
-    serde_helpers::JsonStorageKey,
-    state::StateOverride,
-    trace::{
-        filter::TraceFilter,
-        geth::{
-            GethDebugBuiltInTracerType, GethDebugTracerType, GethDebugTracingCallOptions,
-            GethDebugTracingOptions, GethTrace, NoopFrame,
+    request::TransactionRequest, serde_helpers::JsonStorageKey, state::StateOverride, AccessList,
+    Block as AlloyBlock, BlockId, BlockNumberOrTag as BlockNumber,
+    EIP1186AccountProofResponse as AccountProof, EIP1186StorageProof as StorageProof, Filter,
+    FilteredParams, Header as AlloyHeader, Log, Transaction, TransactionReceipt,
+};
+use alloy_rpc_types_trace::{
+    geth::{DefaultFrame, GethDebugTracingOptions, GethDefaultTracingOptions, GethTrace},
+    parity::LocalizedTransactionTrace,
+};
+use alloy_serde::WithOtherFields;
+use alloy_trie::{proof::ProofRetainer, HashBuilder, Nibbles};
+use anvil_core::{
+    eth::{
+        block::{Block, BlockInfo},
+        transaction::{
+            DepositReceipt, MaybeImpersonatedTransaction, PendingTransaction, ReceiptResponse,
+            TransactionInfo, TypedReceipt, TypedTransaction,
         },
-        parity::{
-            Action::{Call, Create, Reward, Selfdestruct},
-            LocalizedTransactionTrace,
-        },
+        utils::meets_eip155,
     },
     AccessList, Block as AlloyBlock, BlockId, BlockNumberOrTag as BlockNumber,
     EIP1186AccountProofResponse as AccountProof, EIP1186StorageProof as StorageProof, Filter,
@@ -1805,6 +1810,25 @@ impl Backend {
                 }
             }
 
+            // there's an edge case in forking mode if the requested `block_number` is __exactly__
+            // the forked block, which should be fetched from remote but since we allow genesis
+            // accounts this may not be accurate data because an account could be provided via
+            // genesis
+            // So this provides calls the given provided function `f` with a genesis aware database
+            if let Some(fork) = self.get_fork() {
+                if block_number == U256::from(fork.block_number()) {
+                    let mut block = self.env.read().block.clone();
+                    let db = self.db.read().await;
+                    let gen_db = self.genesis.state_db_at_genesis(Box::new(&*db));
+
+                    block.number = block_number;
+                    block.timestamp = U256::from(fork.timestamp());
+                    block.basefee = U256::from(fork.base_fee().unwrap_or_default());
+
+                    return Ok(f(Box::new(&gen_db), block));
+                }
+            }
+
             warn!(target: "backend", "Not historic state found for block={}", block_number);
             return Err(BlockchainError::BlockOutOfRange(
                 self.env.read().block.number.to::<u64>(),
@@ -2360,7 +2384,7 @@ impl Backend {
             let account_proof = AccountProof {
                 address,
                 balance: account.info.balance,
-                nonce: account.info.nonce,
+                nonce: U64::from(account.info.nonce),
                 code_hash: account.info.code_hash,
                 storage_hash: storage_root(&account.storage),
                 account_proof: proof,
@@ -2500,7 +2524,7 @@ impl TransactionValidator for Backend {
             // Light checks first: see if the blob fee cap is too low.
             if let Some(max_fee_per_blob_gas) = tx.essentials().max_fee_per_blob_gas {
                 if let Some(blob_gas_and_price) = &env.block.blob_excess_gas_and_price {
-                    if max_fee_per_blob_gas < blob_gas_and_price.blob_gasprice {
+                    if max_fee_per_blob_gas.to::<u128>() < blob_gas_and_price.blob_gasprice {
                         warn!(target: "backend", "max fee per blob gas={}, too low, block blob gas price={}", max_fee_per_blob_gas, blob_gas_and_price.blob_gasprice);
                         return Err(InvalidTransactionError::BlobFeeCapTooLow);
                     }

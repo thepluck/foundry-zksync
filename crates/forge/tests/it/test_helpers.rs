@@ -94,6 +94,7 @@ impl ForgeTestProfile {
                 failure_persist_dir: Some(tempfile::tempdir().unwrap().into_path()),
                 failure_persist_file: Some("testfailure".to_string()),
                 show_logs: false,
+                no_zksync_reserved_addresses: false,
             })
             .invariant(InvariantConfig {
                 runs: 256,
@@ -111,6 +112,7 @@ impl ForgeTestProfile {
                 max_assume_rejects: 65536,
                 gas_report_samples: 256,
                 failure_persist_dir: Some(tempfile::tempdir().unwrap().into_path()),
+                no_zksync_reserved_addresses: false,
             })
             .build(output, Path::new(self.project().root()))
             .expect("Config loaded")
@@ -208,6 +210,15 @@ impl ForgeTestData {
         self.runner_with_config(config)
     }
 
+    /// Builds a non-tracing zksync runner
+    /// TODO: This needs to be implemented as currently it is a copy of the original function
+    pub fn runner_zksync(&self) -> MultiContractRunner {
+        let mut config = self.config.clone();
+        config.fs_permissions =
+            FsPermissions::new(vec![PathPermission::read_write(manifest_root())]);
+        self.runner_with_zksync_config(config)
+    }
+
     /// Builds a non-tracing runner
     pub fn runner_with_config(&self, mut config: Config) -> MultiContractRunner {
         config.rpc_endpoints = rpc_endpoints();
@@ -223,6 +234,9 @@ impl ForgeTestData {
             opts.isolate = true;
         }
 
+        let env = opts.local_evm_env();
+        let output = self.output.clone();
+
         let sender = config.sender;
 
         let mut builder = self.base_runner();
@@ -231,7 +245,38 @@ impl ForgeTestData {
             .enable_isolation(opts.isolate)
             .sender(sender)
             .with_test_options(self.test_opts.clone())
-            .build(root, &self.output, opts.local_evm_env(), opts)
+            .build(root, output, None, env, opts.clone(), Default::default())
+            .unwrap()
+    }
+
+    /// Builds a non-tracing runner with zksync
+    /// TODO: This needs to be added as currently it is a copy of the original function
+    pub fn runner_with_zksync_config(&self, mut config: Config) -> MultiContractRunner {
+        config.rpc_endpoints = rpc_endpoints();
+        config.allow_paths.push(manifest_root().to_path_buf());
+
+        // no prompt testing
+        config.prompt_timeout = 0;
+
+        let root = self.project.root();
+        let mut opts = self.evm_opts.clone();
+
+        if config.isolate {
+            opts.isolate = true;
+        }
+
+        let env = opts.local_evm_env();
+        let output = self.output.clone();
+
+        let sender = config.sender;
+
+        let mut builder = self.base_runner();
+        builder.config = Arc::new(config);
+        builder
+            .enable_isolation(opts.isolate)
+            .sender(sender)
+            .with_test_options(self.test_opts.clone())
+            .build(root, output, None, env, opts.clone(), Default::default())
             .unwrap()
     }
 
@@ -240,7 +285,14 @@ impl ForgeTestData {
         let mut opts = self.evm_opts.clone();
         opts.verbosity = 5;
         self.base_runner()
-            .build(self.project.root(), &self.output, opts.local_evm_env(), opts)
+            .build(
+                self.project.root(),
+                self.output.clone(),
+                None,
+                opts.local_evm_env(),
+                opts,
+                Default::default(),
+            )
             .unwrap()
     }
 
@@ -256,7 +308,7 @@ impl ForgeTestData {
 
         self.base_runner()
             .with_fork(fork)
-            .build(self.project.root(), &self.output, env, opts)
+            .build(self.project.root(), self.output.clone(), None, env, opts, Default::default())
             .unwrap()
     }
 }
@@ -308,6 +360,16 @@ pub fn get_compiled(project: &mut Project) -> ProjectCompileOutput {
     let mut lock = fd_lock::new_lock(&lock_file_path);
     let read = lock.read().unwrap();
     let out;
+    if project.cache_path().exists() && std::fs::read(&lock_file_path).unwrap() == b"1" {
+        out = project.compile();
+        drop(read);
+    } else {
+        drop(read);
+        let mut write = lock.write().unwrap();
+        write.write_all(b"1").unwrap();
+        out = project.compile();
+        drop(write);
+    }
 
     let mut write = None;
     if !project.cache_path().exists() || std::fs::read(&lock_file_path).unwrap() != b"1" {
@@ -331,6 +393,59 @@ pub fn get_compiled(project: &mut Project) -> ProjectCompileOutput {
 
     out
 }
+
+pub static COMPILED_ZK: Lazy<ZkProjectCompileOutput> = Lazy::new(|| {
+    const LOCK: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/.lock-zk");
+
+    // let libs =
+    //     ["fork/Fork.t.sol:DssExecLib:0xfD88CeE74f7D78697775aBDAE53f9Da1559728E4".to_string()];
+
+    // TODO: fix this to adapt to new way of testing
+    let config = ForgeTestData::new(ForgeTestProfile::Default).config;
+    let zk_project = foundry_zksync_compiler::create_project(&config, true, false).unwrap();
+    let zk_compiler = foundry_common::compile::ProjectCompiler::new();
+    assert!(zk_project.cached);
+
+    // Compile only once per test run.
+    // We need to use a file lock because `cargo-nextest` runs tests in different processes.
+    // This is similar to [`foundry_test_utils::util::initialize`], see its comments for more
+    // details.
+    let mut lock = fd_lock::new_lock(LOCK);
+    let read = lock.read().unwrap();
+    let out;
+    if zk_project.cache_path().exists() && std::fs::read(LOCK).unwrap() == b"1" {
+        out = zk_compiler.zksync_compile(&zk_project, None).unwrap();
+        drop(read);
+    } else {
+        drop(read);
+        let mut write = lock.write().unwrap();
+        write.write_all(b"1").unwrap();
+        out = zk_compiler.zksync_compile(&zk_project, None).unwrap();
+        drop(write);
+    };
+
+    if out.has_compiler_errors() {
+        panic!("Compiled with errors:\n{out}");
+    }
+    out
+});
+
+pub static EVM_OPTS: Lazy<EvmOpts> = Lazy::new(|| EvmOpts {
+    env: Env {
+        gas_limit: u64::MAX,
+        chain_id: None,
+        tx_origin: Config::DEFAULT_SENDER,
+        block_number: 1,
+        block_timestamp: 1,
+        ..Default::default()
+    },
+    sender: Config::DEFAULT_SENDER,
+    initial_balance: U256::MAX,
+    ffi: true,
+    verbosity: 3,
+    memory_limit: 1 << 26,
+    ..Default::default()
+});
 
 /// Default data for the tests group.
 pub static TEST_DATA_DEFAULT: Lazy<ForgeTestData> =

@@ -1,6 +1,6 @@
 //! Anvil specific [`revm::Inspector`] implementation
 
-use crate::revm::Database;
+use crate::{eth::macros::node_info, revm::Database};
 use alloy_primitives::{Address, Log};
 use foundry_evm::{
     call_inspectors,
@@ -60,18 +60,21 @@ impl Inspector {
 }
 
 impl<DB: Database> revm::Inspector<DB> for Inspector {
+    #[inline]
     fn initialize_interp(&mut self, interp: &mut Interpreter, ecx: &mut EvmContext<DB>) {
         call_inspectors!([&mut self.tracer], |inspector| {
             inspector.initialize_interp(interp, ecx);
         });
     }
 
+    #[inline]
     fn step(&mut self, interp: &mut Interpreter, ecx: &mut EvmContext<DB>) {
         call_inspectors!([&mut self.tracer], |inspector| {
             inspector.step(interp, ecx);
         });
     }
 
+    #[inline]
     fn step_end(&mut self, interp: &mut Interpreter, ecx: &mut EvmContext<DB>) {
         call_inspectors!([&mut self.tracer], |inspector| {
             inspector.step_end(interp, ecx);
@@ -156,8 +159,6 @@ impl<DB: Database> revm::Inspector<DB> for Inspector {
         if let Some(tracer) = &mut self.tracer {
             return tracer.eofcreate_end(ecx, inputs, outcome);
         }
-
-        outcome
     }
 
     #[inline]

@@ -10,6 +10,7 @@ use crate::{
     build::LinkedBuildData,
     execute::{ExecutionArtifacts, ExecutionData},
     sequence::get_commit_hash,
+    transaction::ZkTransaction,
     ScriptArgs, ScriptConfig, ScriptResult,
 };
 use alloy_network::TransactionBuilder;
@@ -98,6 +99,7 @@ impl PreSimulationState {
                 let rpc = transaction.rpc.expect("missing broadcastable tx rpc url");
                 let mut runner = runners.get(&rpc).expect("invalid rpc url").write();
 
+                let zk = transaction.zk_tx;
                 let mut tx = transaction.transaction;
                 let to = if let Some(TxKind::Call(to)) = tx.to { Some(to) } else { None };
                 let result = runner
@@ -107,6 +109,7 @@ impl PreSimulationState {
                         to,
                         tx.input.clone().into_input(),
                         tx.value,
+                        (self.script_config.config.zksync.run_in_zk_mode(), zk.clone()),
                     )
                     .wrap_err("Internal EVM error during simulation")?;
 
@@ -141,6 +144,7 @@ impl PreSimulationState {
                     &self.execution_artifacts.decoder,
                     created_contracts,
                     is_fixed_gas_limit,
+                    zk.map(|zk_tx| ZkTransaction { factory_deps: zk_tx.factory_deps }),
                 )?;
 
                 eyre::Ok((Some(tx), result.traces))
@@ -224,6 +228,8 @@ impl PreSimulationState {
             .into_iter()
             .map(|btx| {
                 let mut tx = TransactionWithMetadata::from_tx_request(btx.transaction);
+                tx.zk =
+                    btx.zk_tx.map(|metadata| ZkTransaction { factory_deps: metadata.factory_deps });
                 tx.rpc = btx.rpc.expect("missing broadcastable tx rpc url");
                 tx
             })

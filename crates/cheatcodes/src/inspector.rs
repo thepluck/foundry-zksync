@@ -2,10 +2,10 @@
 
 use crate::{
     evm::{
+        journaled_account,
         mapping::{self, MappingSlots},
-        mock::{MockCallDataContext, MockCallReturnData},
         prank::Prank,
-        DealRecord, RecordAccess,
+        DealRecord,
     },
     inspector::utils::CommonCreateInput,
     script::{Broadcast, ScriptWallets},
@@ -46,6 +46,14 @@ use std::{
     ops::Range,
     path::PathBuf,
     sync::Arc,
+};
+use zksync_types::{
+    block::{pack_block_info, unpack_block_info},
+    get_code_key, get_nonce_key,
+    utils::{decompose_full_nonce, nonces_to_full_nonce, storage_key_for_eth_balance},
+    ACCOUNT_CODE_STORAGE_ADDRESS, CONTRACT_DEPLOYER_ADDRESS, CURRENT_VIRTUAL_BLOCK_INFO_POSITION,
+    H256, KNOWN_CODES_STORAGE_ADDRESS, L2_BASE_TOKEN_ADDRESS, NONCE_HOLDER_ADDRESS,
+    SYSTEM_CONTEXT_ADDRESS,
 };
 
 mod utils;
@@ -194,6 +202,8 @@ pub struct BroadcastableTransaction {
     pub rpc: Option<String>,
     /// The transaction to broadcast.
     pub transaction: TransactionRequest,
+    /// ZK-VM factory deps
+    pub zk_tx: Option<ZkTransactionMetadata>,
 }
 
 /// List of transactions that can be broadcasted.
@@ -315,6 +325,37 @@ pub struct Cheatcodes {
     /// Breakpoints supplied by the `breakpoint` cheatcode.
     /// `char -> (address, pc)`
     pub breakpoints: Breakpoints,
+
+    /// Use ZK-VM to execute CALLs and CREATEs.
+    pub use_zk_vm: bool,
+
+    /// Dual compiled contracts
+    pub dual_compiled_contracts: DualCompiledContracts,
+
+    /// Logs printed during ZK-VM execution.
+    /// EVM logs have the value `None` so they can be interpolated later, since
+    /// they are recorded by [foundry_evm::inspectors::LogCollector] tracer.
+    pub combined_logs: Vec<Option<Log>>,
+
+    /// Starts the cheatcode inspector in ZK mode.
+    /// This is set to `false`, once the startup migration is completed.
+    pub startup_zk: bool,
+
+    /// The list of factory_deps seen so far during a test or script execution.
+    /// Ideally these would be persisted in the storage, but since modifying [revm::JournaledState]
+    /// would be a significant refactor, we maintain the factory_dep part in the [Cheatcodes].
+    /// This can be done as each test runs with its own [Cheatcodes] instance, thereby
+    /// providing the necessary level of isolation.
+    pub persisted_factory_deps: HashMap<H256, Vec<u8>>,
+}
+
+// This is not derived because calling this in `fn new` with `..Default::default()` creates a second
+// `CheatsConfig` which is unused, and inside it `ProjectPathsConfig` is relatively expensive to
+// create.
+impl Default for Cheatcodes {
+    fn default() -> Self {
+        Self::new(Arc::default())
+    }
 }
 
 // This is not derived because calling this in `fn new` with `..Default::default()` creates a second
@@ -329,10 +370,43 @@ impl Default for Cheatcodes {
 impl Cheatcodes {
     /// Creates a new `Cheatcodes` with the given settings.
     pub fn new(config: Arc<CheatsConfig>) -> Self {
+        let mut dual_compiled_contracts = config.dual_compiled_contracts.clone();
+
+        // We add the empty bytecode manually so it is correctly translated in zk mode.
+        // This is used in many places in foundry, e.g. in cheatcode contract's account code.
+        let empty_bytes = Bytes::from_static(&[0]);
+        let zk_bytecode_hash = foundry_zksync_core::hash_bytecode(&foundry_zksync_core::EMPTY_CODE);
+        let zk_deployed_bytecode = foundry_zksync_core::EMPTY_CODE.to_vec();
+
+        dual_compiled_contracts.push(DualCompiledContract {
+            name: String::from("EmptyEVMBytecode"),
+            zk_bytecode_hash,
+            zk_deployed_bytecode: zk_deployed_bytecode.clone(),
+            zk_factory_deps: Default::default(),
+            evm_bytecode_hash: B256::from_slice(&keccak256(&empty_bytes)[..]),
+            evm_deployed_bytecode: Bytecode::new_raw(empty_bytes.clone()).bytecode().to_vec(),
+            evm_bytecode: Bytecode::new_raw(empty_bytes.clone()).bytecode().to_vec(),
+        });
+        dual_compiled_contracts.push(DualCompiledContract {
+            name: String::from("CheatcodeBytecode"),
+            zk_bytecode_hash,
+            zk_deployed_bytecode: zk_deployed_bytecode.clone(),
+            zk_factory_deps: Default::default(),
+            evm_bytecode_hash: CHEATCODE_CONTRACT_HASH,
+            evm_deployed_bytecode: Bytecode::new_raw(empty_bytes.clone()).bytecode().to_vec(),
+            evm_bytecode: Bytecode::new_raw(empty_bytes).bytecode().to_vec(),
+        });
+
+        let mut persisted_factory_deps = HashMap::new();
+        persisted_factory_deps.insert(zk_bytecode_hash, zk_deployed_bytecode);
+
+        let startup_zk = config.use_zk;
         Self {
             fs_commit: true,
             labels: config.labels.clone(),
             config,
+            dual_compiled_contracts,
+            startup_zk,
             block: Default::default(),
             gas_price: Default::default(),
             prank: Default::default(),
@@ -356,7 +430,15 @@ impl Cheatcodes {
             mapping_slots: Default::default(),
             pc: Default::default(),
             breakpoints: Default::default(),
+            combined_logs: Default::default(),
+            use_zk_vm: Default::default(),
+            persisted_factory_deps: Default::default(),
         }
+    }
+
+    /// Returns the configured script wallets.
+    pub fn script_wallets(&self) -> Option<&ScriptWallets> {
+        self.config.script_wallets.as_ref()
     }
 
     /// Returns the configured script wallets.
@@ -383,7 +465,6 @@ impl Cheatcodes {
             }
             e
         })?;
-
         let caller = call.caller;
 
         // ensure the caller is allowed to execute cheatcodes,
@@ -456,6 +537,7 @@ impl Cheatcodes {
         DB: DatabaseExt,
         Input: CommonCreateInput<DB>,
     {
+        
         let ecx = &mut ecx.inner;
         let gas = Gas::new(input.gas_limit());
 
@@ -495,28 +577,90 @@ impl Cheatcodes {
                 ecx.env.tx.caller = broadcast.new_origin;
 
                 if ecx.journaled_state.depth() == broadcast.depth {
-                    input.set_caller(broadcast.new_origin);
-                    let is_fixed_gas_limit = check_if_fixed_gas_limit(ecx, input.gas_limit());
+                    call.caller = broadcast.new_origin;
+                    let is_fixed_gas_limit = check_if_fixed_gas_limit(ecx, call.gas_limit);
 
                     let account = &ecx.journaled_state.state()[&broadcast.new_origin];
+                    let mut to = None;
+                    let mut nonce = account.info.nonce;
+                    let mut call_init_code = call.init_code.clone();
+
+                    let mut zk_tx = if self.use_zk_vm {
+                        to = Some(TxKind::Call(CONTRACT_DEPLOYER_ADDRESS.to_address()));
+                        nonce = foundry_zksync_core::nonce(broadcast.new_origin, ecx) as u64;
+                        let contract = self
+                            .dual_compiled_contracts
+                            .find_by_evm_bytecode(&call.init_code.0)
+                            .unwrap_or_else(|| {
+                                panic!("failed finding contract for {:?}", call.init_code)
+                            });
+                        let factory_deps =
+                            self.dual_compiled_contracts.fetch_all_factory_deps(contract);
+
+                        let constructor_input =
+                            call.init_code[contract.evm_bytecode.len()..].to_vec();
+
+                        let create_input = foundry_zksync_core::encode_create_params(
+                            &call.scheme,
+                            contract.zk_bytecode_hash,
+                            constructor_input,
+                        );
+                        call_init_code = Bytes::from(create_input);
+
+                        Some(factory_deps)
+                    } else {
+                        None
+                    };
+
+                    let rpc = ecx.db.active_fork_url();
+                    if let Some(factory_deps) = zk_tx {
+                        let mut batched =
+                            foundry_zksync_core::vm::batch_factory_dependencies(factory_deps);
+                        debug!(batches = batched.len(), "splitting factory deps for broadcast");
+                        // the last batch is the final one that does the deployment
+                        zk_tx = batched.pop();
+
+                        for factory_deps in batched {
+                            self.broadcastable_transactions.push_back(BroadcastableTransaction {
+                                rpc: rpc.clone(),
+                                transaction: TransactionRequest {
+                                    from: Some(broadcast.new_origin),
+                                    to: Some(TxKind::Call(Address::ZERO)),
+                                    value: Some(call.value),
+                                    nonce: Some(nonce),
+                                    ..Default::default()
+                                },
+                                zk_tx: Some(ZkTransactionMetadata { factory_deps }),
+                            });
+
+                            //update nonce for each tx
+                            nonce += 1;
+                        }
+                    }
+
                     self.broadcastable_transactions.push_back(BroadcastableTransaction {
-                        rpc: ecx.db.active_fork_url(),
+                        rpc: rpc.clone(),
                         transaction: TransactionRequest {
                             from: Some(broadcast.new_origin),
-                            to: None,
-                            value: Some(input.value()),
-                            input: TransactionInput::new(input.init_code()),
-                            nonce: Some(account.info.nonce),
+                            to,
+                            value: Some(call.value),
+                            input: TransactionInput::new(call_init_code),
+                            nonce: Some(nonce),
                             gas: if is_fixed_gas_limit {
-                                Some(input.gas_limit() as u128)
+                                Some(call.gas_limit as u128)
                             } else {
                                 None
                             },
                             ..Default::default()
                         },
+                        zk_tx: zk_tx.map(ZkTransactionMetadata::new),
                     });
 
-                    input.log_debug(self, &input.scheme().unwrap_or(CreateScheme::Create));
+                    let kind = match call.scheme {
+                        CreateScheme::Create => "create",
+                        CreateScheme::Create2 { .. } => "create2",
+                    };
+                    debug!(target: "cheatcodes", tx=?self.broadcastable_transactions.back().unwrap(), "broadcastable {kind}");
                 }
             }
         }
@@ -546,7 +690,81 @@ impl Cheatcodes {
             }]);
         }
 
-        None
+        if self.use_zk_vm {
+            info!("running create in zk vm");
+            if call.init_code.0 == DEFAULT_CREATE2_DEPLOYER_CODE {
+                info!("ignoring DEFAULT_CREATE2_DEPLOYER_CODE for zk");
+                return None
+            }
+
+            let zk_contract = self
+                .dual_compiled_contracts
+                .find_by_evm_bytecode(&call.init_code.0)
+                .unwrap_or_else(|| panic!("failed finding contract for {:?}", call.init_code));
+
+            let factory_deps = self.dual_compiled_contracts.fetch_all_factory_deps(zk_contract);
+            tracing::debug!(contract = zk_contract.name, "using dual compiled contract");
+
+            let ccx = foundry_zksync_core::vm::CheatcodeTracerContext {
+                mocked_calls: self.mocked_calls.clone(),
+                expected_calls: Some(&mut self.expected_calls),
+                accesses: self.accesses.as_mut(),
+                persisted_factory_deps: Some(&mut self.persisted_factory_deps),
+            };
+            if let Ok(result) = foundry_zksync_core::vm::create::<_, DatabaseError>(
+                call,
+                zk_contract,
+                factory_deps,
+                ecx,
+                ccx,
+            ) {
+                self.combined_logs.extend(result.logs.clone().into_iter().map(Some));
+
+                // for each log in cloned logs call handle_expect_emit
+                if !self.expected_emits.is_empty() {
+                    for log in result.logs {
+                        expect::handle_expect_emit(self, &log);
+                    }
+                }
+
+                return match result.execution_result {
+                    ExecutionResult::Success { output, .. } => match output {
+                        Output::Create(bytes, address) => Some(CreateOutcome {
+                            result: InterpreterResult {
+                                result: InstructionResult::Return,
+                                output: bytes,
+                                gas,
+                            },
+                            address,
+                        }),
+                        _ => Some(CreateOutcome {
+                            result: InterpreterResult {
+                                result: InstructionResult::Revert,
+                                output: Bytes::new(),
+                                gas,
+                            },
+                            address: None,
+                        }),
+                    },
+                    ExecutionResult::Revert { output, .. } => Some(CreateOutcome {
+                        result: InterpreterResult {
+                            result: InstructionResult::Revert,
+                            output,
+                            gas,
+                        },
+                        address: None,
+                    }),
+                    ExecutionResult::Halt { .. } => Some(CreateOutcome {
+                        result: InterpreterResult {
+                            result: InstructionResult::Revert,
+                            output: Bytes::from_iter(String::from("zk vm halted").as_bytes()),
+                            gas,
+                        },
+                        address: None,
+                    }),
+                }
+            }
+        }
     }
 
     // common create_end functionality for both legacy and EOF.
@@ -720,6 +938,8 @@ impl Cheatcodes {
         let ecx = &mut ecx.inner;
 
         if call.target_address == HARDHAT_CONSOLE_ADDRESS {
+            self.combined_logs.push(None);
+
             return None;
         }
 
@@ -827,16 +1047,32 @@ impl Cheatcodes {
                                 gas,
                             },
                             memory_offset: call.return_memory_offset.clone(),
-                        });
+                        })
                     }
 
-                    let is_fixed_gas_limit = check_if_fixed_gas_limit(ecx, call.gas_limit);
+                    let is_fixed_gas_limit = check_if_fixed_gas_limit(&ecx.inner, call.gas_limit);
 
                     let account =
-                        ecx.journaled_state.state().get_mut(&broadcast.new_origin).unwrap();
+                        ecx.inner.journaled_state.state().get_mut(&broadcast.new_origin).unwrap();
+
+                    let nonce = if self.use_zk_vm {
+                        foundry_zksync_core::nonce(broadcast.new_origin, ecx) as u64
+                    } else {
+                        account.info.nonce
+                    };
+
+                    let account =
+                        ecx.inner.journaled_state.state().get_mut(&broadcast.new_origin).unwrap();
+
+                    let zk_tx = if self.use_zk_vm {
+                        // We shouldn't need factory_deps for CALLs
+                        Some(ZkTransactionMetadata { factory_deps: Default::default() })
+                    } else {
+                        None
+                    };
 
                     self.broadcastable_transactions.push_back(BroadcastableTransaction {
-                        rpc: ecx.db.active_fork_url(),
+                        rpc: ecx.inner.db.active_fork_url(),
                         transaction: TransactionRequest {
                             from: Some(broadcast.new_origin),
                             to: Some(TxKind::from(Some(call.target_address))),
@@ -850,6 +1086,7 @@ impl Cheatcodes {
                             },
                             ..Default::default()
                         },
+                        zk_tx,
                     });
                     debug!(target: "cheatcodes", tx=?self.broadcastable_transactions.back().unwrap(), "broadcastable call");
 
@@ -919,6 +1156,69 @@ impl Cheatcodes {
                 storageAccesses: vec![], // updated on step
                 depth: ecx.journaled_state.depth(),
             }]);
+        }
+        if self.use_zk_vm {
+            if let TransactTo::Call(test_contract) = ecx.env.tx.transact_to {
+                if call.bytecode_address == test_contract {
+                    info!("using evm for calls to test contract {:?}", ecx.env);
+                    return None
+                }
+            }
+
+            info!("running call in zk vm {:#?}", call);
+
+            let ccx = foundry_zksync_core::vm::CheatcodeTracerContext {
+                mocked_calls: self.mocked_calls.clone(),
+                expected_calls: Some(&mut self.expected_calls),
+                accesses: self.accesses.as_mut(),
+                persisted_factory_deps: Some(&mut self.persisted_factory_deps),
+            };
+            if let Ok(result) = foundry_zksync_core::vm::call::<_, DatabaseError>(call, ecx, ccx) {
+                self.combined_logs.extend(result.logs.clone().into_iter().map(Some));
+                //for each log in cloned logs call handle_expect_emit
+                if !self.expected_emits.is_empty() {
+                    for log in result.logs {
+                        expect::handle_expect_emit(self, &log);
+                    }
+                }
+
+                return match result.execution_result {
+                    ExecutionResult::Success { output, .. } => match output {
+                        Output::Call(bytes) => Some(CallOutcome {
+                            result: InterpreterResult {
+                                result: InstructionResult::Return,
+                                output: bytes,
+                                gas,
+                            },
+                            memory_offset: call.return_memory_offset.clone(),
+                        }),
+                        _ => Some(CallOutcome {
+                            result: InterpreterResult {
+                                result: InstructionResult::Revert,
+                                output: Bytes::new(),
+                                gas,
+                            },
+                            memory_offset: call.return_memory_offset.clone(),
+                        }),
+                    },
+                    ExecutionResult::Revert { output, .. } => Some(CallOutcome {
+                        result: InterpreterResult {
+                            result: InstructionResult::Revert,
+                            output,
+                            gas,
+                        },
+                        memory_offset: call.return_memory_offset.clone(),
+                    }),
+                    ExecutionResult::Halt { .. } => Some(CallOutcome {
+                        result: InterpreterResult {
+                            result: InstructionResult::Revert,
+                            output: Bytes::from_iter(String::from("zk vm halted").as_bytes()),
+                            gas,
+                        },
+                        memory_offset: call.return_memory_offset.clone(),
+                    }),
+                }
+            }
         }
 
         None

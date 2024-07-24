@@ -107,6 +107,7 @@ impl PreExecutionState {
                 self.script_wallets.clone(),
                 self.args.debug,
                 self.build_data.build_data.target.clone(),
+                self.build_data.build_data.dual_compiled_contracts.clone().unwrap_or_default(),
             )
             .await?;
         let result = self.execute_with_runner(&mut runner).await?;
@@ -155,6 +156,7 @@ impl PreExecutionState {
             setup_result.gas_used = script_result.gas_used;
             setup_result.logs.extend(script_result.logs);
             setup_result.traces.extend(script_result.traces);
+            setup_result.debug = script_result.debug;
             setup_result.labeled_addresses.extend(script_result.labeled_addresses);
             setup_result.returned = script_result.returned;
             setup_result.breakpoints = script_result.breakpoints;

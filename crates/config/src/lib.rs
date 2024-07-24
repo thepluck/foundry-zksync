@@ -35,6 +35,9 @@ use foundry_compilers::{
     error::SolcError,
     solc::{CliSettings, SolcSettings},
     ConfigurableArtifacts, Project, ProjectPathsConfig, VyperLanguage,
+    zksolc::ZkSolc,
+    zksolc::ZkSolcSettings,
+    zksync::config::ZkSolcConfig,
 };
 use inflector::Inflector;
 use regex::Regex;
@@ -114,6 +117,8 @@ use vyper::VyperConfig;
 
 mod bind_json;
 use bind_json::BindJsonConfig;
+mod zksync;
+pub use zksync::*;
 
 /// Foundry configuration
 ///
@@ -467,6 +472,9 @@ pub struct Config {
     #[doc(hidden)]
     #[serde(skip)]
     pub _non_exhaustive: (),
+
+    /// @zkSync zkSolc configuration and settings
+    pub zksync: ZkSyncConfig,
 }
 
 /// Mapping of fallback standalone sections. See [`FallbackProfileProvider`]
@@ -844,10 +852,34 @@ impl Config {
             builder = builder.sparse_output(filter);
         }
 
-        let project = builder.build(self.compiler()?)?;
+        let mut project = builder.build(self.compiler()?)?;
 
         if self.force {
             self.cleanup(&project)?;
+        }
+
+        // Set up zksolc project values
+        // TODO: maybe some of these could be included
+        // when setting up the builder for the sake of consistency (requires dedicated
+        // builder methods)
+        project.zksync_zksolc_config = ZkSolcConfig { settings: self.zksync_zksolc_settings()? };
+
+        if let Some(zksolc) = self.zksync_ensure_zksolc()? {
+            project.zksync_zksolc = zksolc;
+        } else {
+            // TODO: we automatically install a zksolc version
+            // if none is found, but maybe we should mirror auto detect settings
+            // as done with solc
+            if !self.offline {
+                let default_version = Version::new(1, 4, 1);
+                let mut zksolc = ZkSolc::find_installed_version(&default_version)?;
+                if zksolc.is_none() {
+                    ZkSolc::blocking_install(&default_version)?;
+                    zksolc = ZkSolc::find_installed_version(&default_version)?;
+                }
+                project.zksync_zksolc = zksolc
+                    .unwrap_or_else(|| panic!("Could not install zksolc v{}", default_version));
+            }
         }
 
         Ok(project)
@@ -912,11 +944,49 @@ impl Config {
         Ok(None)
     }
 
+    /// Ensures that the configured version is installed if explicitly set
+    ///
+    /// If `zksolc` is [`SolcReq::Version`] then this will download and install the solc version if
+    /// it's missing, unless the `offline` flag is enabled, in which case an error is thrown.
+    ///
+    /// If `zksolc` is [`SolcReq::Local`] then this will ensure that the path exists.
+    fn zksync_ensure_zksolc(&self) -> Result<Option<ZkSolc>, SolcError> {
+        if let Some(ref zksolc) = self.zksync.zksolc {
+            let zksolc = match zksolc {
+                SolcReq::Version(version) => {
+                    let mut zksolc = ZkSolc::find_installed_version(version)?;
+                    if zksolc.is_none() {
+                        if self.offline {
+                            return Err(SolcError::msg(format!(
+                                "can't install missing zksolc {version} in offline mode"
+                            )))
+                        }
+                        ZkSolc::blocking_install(version)?;
+                        zksolc = ZkSolc::find_installed_version(version)?;
+                    }
+                    zksolc
+                }
+                SolcReq::Local(zksolc) => {
+                    if !zksolc.is_file() {
+                        return Err(SolcError::msg(format!(
+                            "`zksolc` {} does not exist",
+                            zksolc.display()
+                        )))
+                    }
+                    Some(ZkSolc::new(zksolc))
+                }
+            };
+            return Ok(zksolc)
+        }
+
+        Ok(None)
+    }
+
     /// Returns the [SpecId] derived from the configured [EvmVersion]
     #[inline]
     pub fn evm_spec_id(&self) -> SpecId {
         if self.prague {
-            return SpecId::PRAGUE_EOF
+            return SpecId::PRAGUE
         }
         evm_spec_id(&self.evm_version)
     }
@@ -1352,6 +1422,19 @@ impl Config {
         })
     }
 
+    /// Returns the configured `zksolc` `Settings` that includes:
+    /// - all libraries
+    /// - the optimizer (including details, if configured)
+    /// - evm version
+    pub fn zksync_zksolc_settings(&self) -> Result<ZkSolcSettings, SolcError> {
+        let libraries = match self.parsed_libraries() {
+            Ok(libs) => self.project_paths::<ProjectPathsConfig>().apply_lib_remappings(libs),
+            Err(e) => return Err(SolcError::msg(format!("Failed to parse libraries: {}", e))),
+        };
+
+        Ok(self.zksync.settings(libraries, self.evm_version, self.via_ir))
+    }
+
     /// Returns the default figment
     ///
     /// The default figment reads from the following sources, in ascending
@@ -1554,7 +1637,24 @@ impl Config {
 
     /// Returns the path to the `foundry.toml` of this `Config`.
     pub fn get_config_path(&self) -> PathBuf {
-        self.root.0.join(Self::FILE_NAME)
+        self.root.0.join(Config::FILE_NAME)
+    }
+
+    /// Sets the non-inlinable libraries inside a `foundry.toml` file but only if it exists the
+    /// 'libraries' entry
+    ///
+    /// # Errors
+    ///
+    /// An error if the `foundry.toml` could not be parsed.
+    pub fn update_libraries(&self) -> eyre::Result<()> {
+        self.update(|doc| {
+            let profile = self.profile.as_str().as_str();
+            let libraries: toml_edit::Value =
+                self.libraries.iter().map(toml_edit::Value::from).collect();
+            let libraries = toml_edit::value(libraries);
+            doc[Config::PROFILE_SECTION][profile]["libraries"] = libraries;
+            true
+        })
     }
 
     /// Returns the selected profile.
@@ -1970,6 +2070,30 @@ pub(crate) mod from_opt_glob {
     }
 }
 
+/// Ser/de `globset::Glob` explicitly to handle `Option<Glob>` properly
+pub(crate) mod from_vec_glob {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(value: &[globset::Glob], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let value = value.iter().map(|g| g.glob()).collect::<Vec<_>>();
+        value.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<globset::Glob>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s: Vec<String> = Vec::deserialize(deserializer)?;
+        s.into_iter()
+            .map(|s| globset::Glob::new(&s))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 /// A helper wrapper around the root path used during Config detection
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -2059,7 +2183,7 @@ impl Default for Config {
             allow_paths: vec![],
             include_paths: vec![],
             force: false,
-            evm_version: EvmVersion::Paris,
+            evm_version: EvmVersion::default(),
             gas_reports: vec!["*".to_string()],
             gas_reports_ignore: vec![],
             solc: None,
@@ -2149,6 +2273,7 @@ impl Default for Config {
             extra_args: vec![],
             eof_version: None,
             _non_exhaustive: (),
+            zksync: Default::default(),
         }
     }
 }

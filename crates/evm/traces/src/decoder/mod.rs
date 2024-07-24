@@ -12,7 +12,6 @@ use foundry_common::{
     abi::get_indexed_event, fmt::format_token, get_contract_name, ContractsByArtifact, SELECTOR_LEN,
 };
 use foundry_evm_core::{
-    abi::{Console, HardhatConsole, Vm, HARDHAT_CONSOLE_SELECTOR_PATCHES},
     constants::{
         CALLER, CHEATCODE_ADDRESS, DEFAULT_CREATE2_DEPLOYER, HARDHAT_CONSOLE_ADDRESS,
         TEST_CONTRACT_ADDRESS,
@@ -267,10 +266,9 @@ impl CallTraceDecoder {
             .nodes()
             .iter()
             .map(|node| {
-                (
-                    &node.trace.address,
-                    node.trace.kind.is_any_create().then_some(&node.trace.output[..]),
-                )
+                let address = &node.trace.address;
+                let output = node.trace.kind.is_any_create().then_some(&node.trace.output[..]);
+                (address, output)
             })
             .filter(|&(address, _)| {
                 !self.labels.contains_key(address) || !self.contracts.contains_key(address)

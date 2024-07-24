@@ -19,6 +19,8 @@ pub struct ExecutorBuilder {
     /// The spec ID.
     spec_id: SpecId,
     legacy_assertions: bool,
+
+    use_zk: bool,
 }
 
 impl Default for ExecutorBuilder {
@@ -29,6 +31,7 @@ impl Default for ExecutorBuilder {
             gas_limit: None,
             spec_id: SpecId::LATEST,
             legacy_assertions: false,
+            use_zk: false,
         }
     }
 }
@@ -68,13 +71,18 @@ impl ExecutorBuilder {
     #[inline]
     pub fn legacy_assertions(mut self, legacy_assertions: bool) -> Self {
         self.legacy_assertions = legacy_assertions;
+    }
+    /// Sets the EVM spec to use
+    #[inline]
+    pub fn use_zk_vm(mut self, enable: bool) -> Self {
+        self.use_zk = enable;
         self
     }
 
     /// Builds the executor as configured.
     #[inline]
     pub fn build(self, env: Env, db: Backend) -> Executor {
-        let Self { mut stack, gas_limit, spec_id, legacy_assertions } = self;
+        let Self { mut stack, gas_limit, spec_id, legacy_assertions, use_zk} = self;
         if stack.block.is_none() {
             stack.block = Some(env.block.clone());
         }
@@ -83,6 +91,8 @@ impl ExecutorBuilder {
         }
         let gas_limit = gas_limit.unwrap_or_else(|| env.block.gas_limit.saturating_to());
         let env = EnvWithHandlerCfg::new_with_spec_id(Box::new(env), spec_id);
-        Executor::new(db, env, stack.build(), gas_limit, legacy_assertions)
+        let exec = Executor::new(db, env, stack.build(), gas_limit, legacy_assertions)
+        exec.use_zk = use_zk;
+        exec
     }
 }

@@ -1,5 +1,5 @@
 use crate::eth::error::BlockchainError;
-use alloy_consensus::SignableTransaction;
+use alloy_consensus::{SignableTransaction, Signed};
 use alloy_dyn_abi::TypedData;
 use alloy_network::TxSignerSync;
 use alloy_primitives::{Address, Signature, B256};
@@ -130,6 +130,10 @@ pub fn build_typed_transaction(
         }
         TypedTransactionRequest::EIP4844(tx) => {
             TypedTransaction::EIP4844(tx.into_signed(signature))
+        }
+        TypedTransactionRequest::EIP4844(tx) => {
+            let sighash = tx.signature_hash();
+            TypedTransaction::EIP4844(Signed::new_unchecked(tx, signature, sighash))
         }
         TypedTransactionRequest::Deposit(tx) => {
             let DepositTransactionRequest {

@@ -197,6 +197,7 @@ seed = '0x3e8'
 dictionary_weight = 40
 include_storage = true
 include_push_bytes = true
+no_zksync_reserved_addresses = true
 
 [invariant]
 runs = 256
@@ -207,11 +208,46 @@ dictionary_weight = 80
 include_storage = true
 include_push_bytes = true
 shrink_run_limit = 5000
+no_zksync_reserved_addresses = true
 
 [fmt]
 line_length = 100
 tab_width = 2
 bracket_spacing = true
+```
+
+#### ZkSync settings
+
+ZkSync configuration can be tweaked with the [`ZkSyncConfig`](./src/zksync.rs) object.
+The `zksync` settings must be prefixed with the profile they correspond to:
+`[profile.default.zksync]` belongs to the `[profile.default]` profile
+
+``` toml
+[profile.default.zksync] 
+# Compile contracts for zkVM
+compile = false 
+# Enable zkVM at startup, needs `compile = true` to have effect
+startup = true
+# By default the latest version is used
+zksolc = "1.5.0" 
+# By default the corresponding solc patched version from matter-labs is used
+solc_path = "./solc-0.8.23-1.0.1"
+bytecode_hash = "none" 
+# Allow compiler to use mode 'z' if contracts won't fit in the EraVM bytecode 
+# size limitations
+fallback_oz = false 
+# Enable EraVM extensions (ex system-mode)
+eravm_extensions = false
+# Force compilation via EVMLA instead of Yul codegen pipeline
+force_evmla = false 
+# List of globs that match contracts to avoid compiling with zksolc
+avoid_contracts = []
+# Enable optimizer on zksolc (defaults to true)
+optimizer = true 
+# zksolc optimizer mode (0 | 1 | 2 | 3 | s | z)
+optimizer_mode = '3'
+# zksolc optimizer details 
+optimizer_details = { ... }
 ```
 
 #### Additional Optimizer settings

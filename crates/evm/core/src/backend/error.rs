@@ -24,6 +24,8 @@ pub enum BackendError {
          For a test environment, you can use `etch` to place the required bytecode at that address."
     )]
     MissingCreate2Deployer,
+    #[error("failed to get bytecode for {0:?}: {1}")]
+    GetBytecode(B256, Arc<eyre::Error>),
     #[error("{0}")]
     Other(String),
 }

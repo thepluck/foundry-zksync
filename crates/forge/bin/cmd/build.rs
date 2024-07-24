@@ -76,7 +76,7 @@ pub struct BuildArgs {
 }
 
 impl BuildArgs {
-    pub fn run(self) -> Result<ProjectCompileOutput> {
+    pub fn run(self) -> Result<()> {
         let mut config = self.try_load_config_emit_warnings()?;
 
         if install::install_missing_dependencies(&mut config, self.args.silent) &&
@@ -86,7 +86,8 @@ impl BuildArgs {
             config = self.load_config();
         }
 
-        let project = config.project()?;
+        if !config.zksync.should_compile() {
+            let project = config.project()?;
 
         // Collect sources to compile if build subdirectories specified.
         let mut files = vec![];
@@ -110,8 +111,22 @@ impl BuildArgs {
         if self.format_json {
             println!("{}", serde_json::to_string_pretty(&output.output())?);
         }
+        } else {
+            let zk_project = foundry_zksync_compiler::create_project(&config, config.cache, false)?;
+            let zk_compiler = ProjectCompiler::new()
+                .print_names(self.names)
+                .print_sizes(self.sizes)
+                .quiet(self.format_json)
+                .bail(!self.format_json);
 
-        Ok(output)
+            let zk_output =
+                zk_compiler.zksync_compile(&zk_project, config.zksync.avoid_contracts())?;
+            if self.format_json {
+                println!("{}", serde_json::to_string_pretty(&zk_output.output())?);
+            }
+        }
+
+        Ok(())
     }
 
     /// Returns the `Project` for the current workspace

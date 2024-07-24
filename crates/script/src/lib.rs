@@ -352,6 +352,8 @@ impl ScriptArgs {
         result: &ScriptResult,
         known_contracts: &ContractsByArtifact,
     ) -> Result<()> {
+        //TODO: zk mode contract size check
+
         // (name, &init, &deployed)[]
         let mut bytecodes: Vec<(String, &[u8], &[u8])> = vec![];
 
@@ -543,13 +545,23 @@ impl ScriptConfig {
         script_wallets: ScriptWallets,
         debug: bool,
         target: ArtifactId,
+        dual_compiled_contracts: DualCompiledContracts,
     ) -> Result<ScriptRunner> {
-        self._get_runner(Some((known_contracts, script_wallets, target)), debug).await
+        self._get_runner(
+            Some((known_contracts, script_wallets, target, dual_compiled_contracts)),
+            debug,
+        )
+        .await
     }
 
     async fn _get_runner(
         &mut self,
-        cheats_data: Option<(ContractsByArtifact, ScriptWallets, ArtifactId)>,
+        cheats_data: Option<(
+            ContractsByArtifact,
+            ScriptWallets,
+            ArtifactId,
+            DualCompiledContracts,
+        )>,
         debug: bool,
     ) -> Result<ScriptRunner> {
         trace!("preparing script runner");
@@ -581,6 +593,7 @@ impl ScriptConfig {
             .gas_limit(self.evm_opts.gas_limit())
             .legacy_assertions(self.config.legacy_assertions);
 
+            let use_zk = self.config.zksync.run_in_zk_mode();
         if let Some((known_contracts, script_wallets, target)) = cheats_data {
             builder = builder.inspectors(|stack| {
                 stack
@@ -591,12 +604,16 @@ impl ScriptConfig {
                             Some(known_contracts),
                             Some(script_wallets),
                             Some(target.version),
+                            dual_compiled_contracts,
+                            use_zk,
                         )
                         .into(),
                     )
                     .enable_isolation(self.evm_opts.isolate)
             });
         }
+
+        
 
         Ok(ScriptRunner::new(builder.build(env, db), self.evm_opts.clone()))
     }

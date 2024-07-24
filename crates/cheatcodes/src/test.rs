@@ -4,9 +4,60 @@ use crate::{Cheatcode, Cheatcodes, CheatsCtxt, DatabaseExt, Error, Result, Vm::*
 use alloy_primitives::Address;
 use alloy_sol_types::SolValue;
 use foundry_evm_core::constants::{MAGIC_ASSUME, MAGIC_SKIP};
+use foundry_zksync_compiler::DualCompiledContract;
 
 pub(crate) mod assert;
 pub(crate) mod expect;
+
+impl Cheatcode for zkVmCall {
+    fn apply_full<DB: DatabaseExt>(&self, ccx: &mut CheatsCtxt<DB>) -> Result {
+        let Self { enable } = *self;
+
+        if enable {
+            ccx.state.select_zk_vm(ccx.ecx, None);
+        } else {
+            ccx.state.select_evm(ccx.ecx);
+        }
+
+        Ok(Default::default())
+    }
+}
+
+impl Cheatcode for zkRegisterContractCall {
+    fn apply_full<DB: DatabaseExt>(&self, ccx: &mut CheatsCtxt<DB>) -> Result {
+        let Self {
+            name,
+            evmBytecodeHash,
+            evmDeployedBytecode,
+            evmBytecode,
+            zkBytecodeHash,
+            zkDeployedBytecode,
+        } = self;
+
+        let new_contract = DualCompiledContract {
+            name: name.clone(),
+            zk_bytecode_hash: zkBytecodeHash.0.into(),
+            zk_deployed_bytecode: zkDeployedBytecode.to_vec(),
+            //TODO: add argument to cheatcode
+            zk_factory_deps: vec![],
+            evm_bytecode_hash: *evmBytecodeHash,
+            evm_deployed_bytecode: evmDeployedBytecode.to_vec(),
+            evm_bytecode: evmBytecode.to_vec(),
+        };
+
+        if let Some(existing) = ccx.state.dual_compiled_contracts.iter().find(|contract| {
+            contract.evm_bytecode_hash == new_contract.evm_bytecode_hash &&
+                contract.zk_bytecode_hash == new_contract.zk_bytecode_hash
+        }) {
+            warn!(name = existing.name, "contract already exists with the given bytecode hashes");
+            return Ok(Default::default())
+        }
+
+        ccx.state.dual_compiled_contracts.push(new_contract);
+
+        Ok(Default::default())
+    }
+}
 
 impl Cheatcode for assumeCall {
     fn apply(&self, _state: &mut Cheatcodes) -> Result {

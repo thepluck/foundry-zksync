@@ -1863,7 +1863,7 @@ impl EthApi {
             current_block_number: self.backend.best_number(),
             current_block_timestamp: env.block.timestamp.try_into().unwrap_or(u64::MAX),
             current_block_hash: self.backend.best_hash(),
-            hard_fork: hard_fork.to_string(),
+            hard_fork: env.handler_cfg.spec_id,
             transaction_order: match *tx_order {
                 TransactionOrder::Fifo => "fifo".to_string(),
                 TransactionOrder::Fees => "fees".to_string(),
@@ -1871,8 +1871,8 @@ impl EthApi {
             environment: NodeEnvironment {
                 base_fee: U256::from(self.backend.base_fee()),
                 chain_id: self.backend.chain_id().to::<u64>(),
-                gas_limit: U256::from(self.backend.gas_limit()),
-                gas_price: U256::from(self.gas_price()),
+                gas_limit: self.backend.gas_limit(),
+                gas_price: self.gas_price(),
             },
             fork_config: fork_config
                 .map(|fork| {
@@ -2746,6 +2746,7 @@ fn ensure_return_ok(exit: InstructionResult, out: &Option<Output>) -> Result<Byt
 }
 
 /// Determines the minimum gas needed for a transaction depending on the transaction kind.
+#[inline]
 fn determine_base_gas_by_kind(request: &WithOtherFields<TransactionRequest>) -> u128 {
     match transaction_request_to_typed(request.clone()) {
         Some(request) => match request {

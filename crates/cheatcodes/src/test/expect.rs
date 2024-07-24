@@ -1,9 +1,10 @@
 use crate::{Cheatcode, Cheatcodes, CheatsCtxt, DatabaseExt, Result, Vm::*};
 use alloy_primitives::{address, hex, Address, Bytes, LogData as RawLog, U256};
 use alloy_sol_types::{SolError, SolValue};
+use foundry_cheatcodes_common::expect::{ExpectedCallData, ExpectedCallType};
 use revm::interpreter::{return_ok, InstructionResult};
 use spec::Vm;
-use std::collections::{hash_map::Entry, HashMap};
+use std::collections::hash_map::Entry;
 
 /// For some cheatcodes we may internally change the status of the call, i.e. in `expectRevert`.
 /// Solidity will see a successful call and attempt to decode the return data. Therefore, we need

@@ -25,6 +25,7 @@ use foundry_evm::{
 use foundry_linking::{LinkOutput, Linker};
 use rayon::prelude::*;
 use revm::primitives::SpecId;
+
 use std::{
     borrow::Borrow,
     collections::BTreeMap,
@@ -78,6 +79,10 @@ pub struct MultiContractRunner {
     pub libs_to_deploy: Vec<Bytes>,
     /// Library addresses used to link contracts.
     pub libraries: Libraries,
+    /// Dual compiled contracts
+    pub dual_compiled_contracts: DualCompiledContracts,
+    /// Use zk runner.
+    pub use_zk: bool,
 }
 
 impl MultiContractRunner {
@@ -166,11 +171,12 @@ impl MultiContractRunner {
         tx: mpsc::Sender<(String, SuiteResult)>,
         show_progress: bool,
     ) {
-        let tokio_handle = tokio::runtime::Handle::current();
+        let handle = tokio::runtime::Handle::current();
         trace!("running all tests");
 
         // The DB backend that serves all the data.
-        let db = Backend::spawn(self.fork.take());
+        let mut db = Backend::spawn(self.fork.take());
+        db.is_zk = self.use_zk;
 
         let find_timer = Instant::now();
         let contracts = self.matching_contracts(filter).collect::<Vec<_>>();
@@ -188,7 +194,7 @@ impl MultiContractRunner {
             let results: Vec<(String, SuiteResult)> = contracts
                 .par_iter()
                 .map(|&(id, contract)| {
-                    let _guard = tokio_handle.enter();
+                    let _guard = handle.enter();
                     tests_progress.inner.lock().start_suite_progress(&id.identifier());
 
                     let result = self.run_test_suite(
@@ -196,7 +202,7 @@ impl MultiContractRunner {
                         contract,
                         db.clone(),
                         filter,
-                        &tokio_handle,
+                        &handle,
                         Some(&tests_progress),
                     );
 
@@ -216,9 +222,8 @@ impl MultiContractRunner {
             });
         } else {
             contracts.par_iter().for_each(|&(id, contract)| {
-                let _guard = tokio_handle.enter();
-                let result =
-                    self.run_test_suite(id, contract, db.clone(), filter, &tokio_handle, None);
+                let _guard = handle.enter();
+                let result = self.run_test_suite(id, contract, db.clone(), filter, &handle, None);
                 let _ = tx.send((id.identifier(), result));
             })
         }
@@ -230,7 +235,7 @@ impl MultiContractRunner {
         contract: &TestContract,
         db: Backend,
         filter: &dyn TestFilter,
-        tokio_handle: &tokio::runtime::Handle,
+        handle: &tokio::runtime::Handle,
         progress: Option<&TestsProgress>,
     ) -> SuiteResult {
         let identifier = artifact_id.identifier();
@@ -385,15 +390,32 @@ impl MultiContractRunnerBuilder {
     pub fn build<C: Compiler>(
         self,
         root: &Path,
-        output: &ProjectCompileOutput<C>,
+        output: ProjectCompileOutput<C>,
+        zk_output: Option<ZkProjectCompileOutput>,
         env: revm::primitives::Env,
         evm_opts: EvmOpts,
+        dual_compiled_contracts: DualCompiledContracts,
     ) -> Result<MultiContractRunner> {
-        let contracts = output
-            .artifact_ids()
-            .map(|(id, v)| (id.with_stripped_file_prefixes(root), v))
-            .collect();
-        let linker = Linker::new(root, contracts);
+        let use_zk = zk_output.is_some();
+        let mut known_contracts = ContractsByArtifact::default();
+        let output = output.with_stripped_file_prefixes(root);
+        let linker = Linker::new(root, output.artifact_ids().collect());
+
+        // Build revert decoder from ABIs of all artifacts.
+        let abis = linker
+            .contracts
+            .iter()
+            .filter_map(|(_, contract)| contract.abi.as_ref().map(|abi| abi.borrow()));
+        let revert_decoder = RevertDecoder::new().with_abis(abis);
+
+        let LinkOutput { libraries, libs_to_deploy } = linker.link_with_nonce_or_address(
+            Default::default(),
+            LIBRARY_DEPLOYER,
+            0,
+            linker.contracts.keys(),
+        )?;
+
+        let linked_contracts = linker.get_linked_artifacts(&libraries)?;
 
         // Build revert decoder from ABIs of all artifacts.
         let abis = linker
@@ -432,7 +454,47 @@ impl MultiContractRunnerBuilder {
             }
         }
 
-        let known_contracts = ContractsByArtifact::new(linked_contracts);
+        if !use_zk {
+            known_contracts = ContractsByArtifact::new(linked_contracts);
+        } else if let Some(zk_output) = zk_output {
+            let zk_contracts = zk_output.with_stripped_file_prefixes(root).into_artifacts();
+            let mut zk_contracts_map = BTreeMap::new();
+
+            for (id, contract) in zk_contracts {
+                if let Some(metadata) = contract.metadata {
+                    if let Some(solc_metadata_value) =
+                        metadata.get("solc_metadata").and_then(serde_json::Value::as_str)
+                    {
+                        if let Ok(solc_metadata_json) =
+                            serde_json::from_str::<serde_json::Value>(solc_metadata_value)
+                        {
+                            let abi: JsonAbi = JsonAbi::from_json_str(
+                                &solc_metadata_json["output"]["abi"].to_string(),
+                            )?;
+                            let bytecode = contract.bytecode.as_ref();
+
+                            if let Some(bytecode_object) = bytecode.map(|b| b.object.clone()) {
+                                let compact_bytecode = CompactBytecode {
+                                    object: bytecode_object.clone(),
+                                    source_map: None,
+                                    link_references: BTreeMap::new(),
+                                };
+                                let compact_contract = CompactContractBytecode {
+                                    abi: Some(abi),
+                                    bytecode: Some(compact_bytecode.clone()),
+                                    deployed_bytecode: Some(CompactDeployedBytecode {
+                                        bytecode: Some(compact_bytecode),
+                                        immutable_references: BTreeMap::new(),
+                                    }),
+                                };
+                                zk_contracts_map.insert(id.clone(), compact_contract);
+                            }
+                        }
+                    }
+                }
+            }
+            known_contracts = ContractsByArtifact::new(zk_contracts_map);
+        }
 
         Ok(MultiContractRunner {
             contracts: deployable_contracts,
@@ -451,6 +513,8 @@ impl MultiContractRunnerBuilder {
             known_contracts,
             libs_to_deploy,
             libraries,
+            dual_compiled_contracts,
+            use_zk,
         })
     }
 }

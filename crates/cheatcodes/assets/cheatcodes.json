@@ -8633,6 +8633,26 @@
     },
     {
       "func": {
+        "id": "zkRegisterContract",
+        "description": "Registers bytecodes for ZK-VM for transact/call and create instructions.",
+        "declaration": "function zkRegisterContract(string calldata name, bytes32 evmBytecodeHash, bytes calldata evmDeployedBytecode, bytes calldata evmBytecode, bytes32 zkBytecodeHash, bytes calldata zkDeployedBytecode) external pure;",
+        "visibility": "external",
+        "mutability": "pure",
+        "signature": "zkRegisterContract(string,bytes32,bytes,bytes,bytes32,bytes)",
+        "selector": "0x428cb039",
+        "selectorBytes": [
+          66,
+          140,
+          176,
+          57
+        ]
+      },
+      "group": "testing",
+      "status": "stable",
+      "safety": "safe"
+    },
+    {
+      "func": {
         "id": "writeToml_0",
         "description": "Takes serialized JSON, converts to TOML and write a serialized TOML to a file.",
         "declaration": "function writeToml(string calldata json, string calldata path) external;",
@@ -8648,6 +8668,26 @@
         ]
       },
       "group": "toml",
+      "status": "stable",
+      "safety": "safe"
+    },
+    {
+      "func": {
+        "id": "zkVm",
+        "description": "Enables/Disables use ZK-VM usage for transact/call and create instructions.",
+        "declaration": "function zkVm(bool enable) external pure;",
+        "visibility": "external",
+        "mutability": "pure",
+        "signature": "zkVm(bool)",
+        "selector": "0x9d7804fe",
+        "selectorBytes": [
+          157,
+          120,
+          4,
+          254
+        ]
+      },
+      "group": "testing",
       "status": "stable",
       "safety": "safe"
     },

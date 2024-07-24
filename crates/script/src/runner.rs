@@ -12,6 +12,7 @@ use foundry_evm::{
     revm::interpreter::{return_ok, InstructionResult},
     traces::{TraceKind, Traces},
 };
+use foundry_zksync_core::ZkTransactionMetadata;
 use std::collections::VecDeque;
 use yansi::Paint;
 
@@ -37,7 +38,7 @@ impl ScriptRunner {
         is_broadcast: bool,
         need_create2_deployer: bool,
     ) -> Result<(Address, ScriptResult)> {
-        trace!(target: "script", "executing setUP()");
+        info!(target: "script", "executing setUP()");
 
         if !is_broadcast {
             if self.evm_opts.sender == Config::DEFAULT_SENDER {
@@ -79,6 +80,7 @@ impl ScriptRunner {
                         nonce: Some(sender_nonce + library_transactions.len() as u64),
                         ..Default::default()
                     },
+                    zk_tx: None,
                 })
             }),
             ScriptPredeployLibraries::Create2(libraries, salt) => {
@@ -113,6 +115,7 @@ impl ScriptRunner {
                             to: Some(TxKind::Call(DEFAULT_CREATE2_DEPLOYER)),
                             ..Default::default()
                         },
+                        zk_tx: None,
                     });
                 }
 
@@ -217,7 +220,13 @@ impl ScriptRunner {
         to: Option<Address>,
         calldata: Option<Bytes>,
         value: Option<U256>,
+        (use_zk, zk_tx): (bool, Option<ZkTransactionMetadata>),
     ) -> Result<ScriptResult> {
+        self.executor.use_zk = use_zk;
+        if let Some(zk_tx) = zk_tx {
+            self.executor.setup_zk_tx(zk_tx);
+        }
+
         if let Some(to) = to {
             self.call(from, to, calldata.unwrap_or_default(), value.unwrap_or(U256::ZERO), true)
         } else if to.is_none() {
@@ -227,7 +236,11 @@ impl ScriptRunner {
                 value.unwrap_or(U256::ZERO),
                 None,
             );
+<<<<<<< HEAD
             let (address, RawCallResult { gas_used, logs, traces, .. }) = match res {
+=======
+            let (address, RawCallResult { gas_used, logs, traces, debug, .. }) = match res {
+>>>>>>> dev
                 Ok(DeployResult { address, raw }) => (address, raw),
                 Err(EvmError::Execution(err)) => {
                     let ExecutionErr { raw, reason } = *err;

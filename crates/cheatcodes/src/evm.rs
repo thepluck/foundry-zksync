@@ -69,6 +69,12 @@ impl Cheatcode for addrCall {
 impl Cheatcode for getNonce_0Call {
     fn apply_stateful<DB: DatabaseExt>(&self, ccx: &mut CheatsCtxt<DB>) -> Result {
         let Self { account } = self;
+
+        if ccx.state.use_zk_vm {
+            let nonce = foundry_zksync_core::cheatcodes::get_nonce(*account, ccx.ecx);
+            return Ok(nonce.abi_encode());
+        }
+
         get_nonce(ccx, account)
     }
 }
@@ -346,6 +352,11 @@ impl Cheatcode for getBlobhashesCall {
 impl Cheatcode for rollCall {
     fn apply_stateful<DB: DatabaseExt>(&self, ccx: &mut CheatsCtxt<DB>) -> Result {
         let Self { newHeight } = self;
+        if ccx.state.use_zk_vm {
+            foundry_zksync_core::cheatcodes::roll(*newHeight, ccx.ecx);
+            return Ok(Default::default())
+        }
+
         ccx.ecx.env.block.number = *newHeight;
         Ok(Default::default())
     }
@@ -369,7 +380,12 @@ impl Cheatcode for txGasPriceCall {
 impl Cheatcode for warpCall {
     fn apply_stateful<DB: DatabaseExt>(&self, ccx: &mut CheatsCtxt<DB>) -> Result {
         let Self { newTimestamp } = self;
+        if ccx.state.use_zk_vm {
+            foundry_zksync_core::cheatcodes::warp(*newTimestamp, ccx.ecx);
+            return Ok(Default::default())
+        }
         ccx.ecx.env.block.timestamp = *newTimestamp;
+
         Ok(Default::default())
     }
 }
@@ -404,8 +420,13 @@ impl Cheatcode for getBlobBaseFeeCall {
 impl Cheatcode for dealCall {
     fn apply_stateful<DB: DatabaseExt>(&self, ccx: &mut CheatsCtxt<DB>) -> Result {
         let Self { account: address, newBalance: new_balance } = *self;
-        let account = journaled_account(ccx.ecx, address)?;
-        let old_balance = std::mem::replace(&mut account.info.balance, new_balance);
+        let old_balance = if ccx.state.use_zk_vm {
+            foundry_zksync_core::cheatcodes::deal(address, new_balance, ccx.ecx)
+        } else {
+            let account = journaled_account(ccx.ecx, address)?;
+            std::mem::replace(&mut account.info.balance, new_balance)
+        };
+
         let record = DealRecord { address, old_balance, new_balance };
         ccx.state.eth_deals.push(record);
         Ok(Default::default())
@@ -415,6 +436,12 @@ impl Cheatcode for dealCall {
 impl Cheatcode for etchCall {
     fn apply_stateful<DB: DatabaseExt>(&self, ccx: &mut CheatsCtxt<DB>) -> Result {
         let Self { target, newRuntimeBytecode } = self;
+        if ccx.state.use_zk_vm {
+            foundry_zksync_core::cheatcodes::etch(*target, newRuntimeBytecode, ccx.ecx);
+
+            return Ok(Default::default());
+        }
+
         ensure_not_precompile!(target, ccx);
         ccx.ecx.load_account(*target)?;
         let bytecode = Bytecode::new_raw(Bytes::copy_from_slice(newRuntimeBytecode));
@@ -426,6 +453,11 @@ impl Cheatcode for etchCall {
 impl Cheatcode for resetNonceCall {
     fn apply_stateful<DB: DatabaseExt>(&self, ccx: &mut CheatsCtxt<DB>) -> Result {
         let Self { account } = self;
+        if ccx.state.use_zk_vm {
+            foundry_zksync_core::cheatcodes::set_nonce(*account, U256::ZERO, ccx.ecx);
+            return Ok(Default::default());
+        }
+
         let account = journaled_account(ccx.ecx, *account)?;
         // Per EIP-161, EOA nonces start at 0, but contract nonces
         // start at 1. Comparing by code_hash instead of code
@@ -441,6 +473,12 @@ impl Cheatcode for resetNonceCall {
 impl Cheatcode for setNonceCall {
     fn apply_stateful<DB: DatabaseExt>(&self, ccx: &mut CheatsCtxt<DB>) -> Result {
         let Self { account, newNonce } = *self;
+
+        if ccx.state.use_zk_vm {
+            foundry_zksync_core::cheatcodes::set_nonce(account, U256::from(newNonce), ccx.ecx);
+            return Ok(Default::default());
+        }
+
         let account = journaled_account(ccx.ecx, account)?;
         // nonce must increment only
         let current = account.info.nonce;
@@ -457,6 +495,12 @@ impl Cheatcode for setNonceCall {
 impl Cheatcode for setNonceUnsafeCall {
     fn apply_stateful<DB: DatabaseExt>(&self, ccx: &mut CheatsCtxt<DB>) -> Result {
         let Self { account, newNonce } = *self;
+
+        if ccx.state.use_zk_vm {
+            foundry_zksync_core::cheatcodes::set_nonce(account, U256::from(newNonce), ccx.ecx);
+            return Ok(Default::default());
+        }
+
         let account = journaled_account(ccx.ecx, account)?;
         account.info.nonce = newNonce;
         Ok(Default::default())

@@ -8,6 +8,7 @@ use foundry_config::{
     ResolvedRpcEndpoints,
 };
 use foundry_evm_core::opts::EvmOpts;
+use foundry_zksync_compiler::DualCompiledContracts;
 use semver::Version;
 use std::{
     collections::HashMap,
@@ -54,6 +55,10 @@ pub struct CheatsConfig {
     pub running_version: Option<Version>,
     /// Whether to enable legacy (non-reverting) assertions.
     pub assertions_revert: bool,
+    /// ZKSolc -> Solc Contract codes
+    pub dual_compiled_contracts: DualCompiledContracts,
+    /// Use ZK-VM on startup
+    pub use_zk: bool,
 }
 
 impl CheatsConfig {
@@ -64,6 +69,8 @@ impl CheatsConfig {
         available_artifacts: Option<ContractsByArtifact>,
         script_wallets: Option<ScriptWallets>,
         running_version: Option<Version>,
+        dual_compiled_contracts: DualCompiledContracts,
+        use_zk: bool,
     ) -> Self {
         let mut allowed_paths = vec![config.root.0.clone()];
         allowed_paths.extend(config.libs.clone());
@@ -93,6 +100,8 @@ impl CheatsConfig {
             available_artifacts,
             running_version,
             assertions_revert: config.assertions_revert,
+            dual_compiled_contracts,
+            use_zk,
         }
     }
 
@@ -221,6 +230,8 @@ impl Default for CheatsConfig {
             available_artifacts: Default::default(),
             running_version: Default::default(),
             assertions_revert: true,
+            dual_compiled_contracts: Default::default(),
+            use_zk: false,
         }
     }
 }
@@ -237,6 +248,8 @@ mod tests {
             None,
             None,
             None,
+            Default::default(),
+            false,
         )
     }
 

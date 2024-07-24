@@ -309,6 +309,8 @@ impl SessionSource {
                         None,
                         None,
                         Some(self.solc.version.clone()),
+                        Default::default(),
+                        false,
                     )
                     .into(),
                 )

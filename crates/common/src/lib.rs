@@ -16,6 +16,7 @@ pub use foundry_common_fmt as fmt;
 pub mod abi;
 pub mod calc;
 pub mod compile;
+pub mod console;
 pub mod constants;
 pub mod contracts;
 pub mod ens;
@@ -32,6 +33,7 @@ pub mod traits;
 pub mod transactions;
 mod utils;
 
+pub use console::*;
 pub use constants::*;
 pub use contracts::*;
 pub use traits::*;

@@ -420,9 +420,12 @@ impl<T: Serialize> ToRpcResponseResult for Result<T> {
                 err @ BlockchainError::EIP4844TransactionUnsupportedAtHardfork => {
                     RpcError::invalid_params(err.to_string())
                 }
+<<<<<<< HEAD
                 err @ BlockchainError::EIP7702TransactionUnsupportedAtHardfork => {
                     RpcError::invalid_params(err.to_string())
                 }
+=======
+>>>>>>> dev
                 err @ BlockchainError::DepositTransactionUnsupported => {
                     RpcError::invalid_params(err.to_string())
                 }

@@ -22,6 +22,12 @@ pub struct AdditionalContract {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ZkTransaction {
+    pub factory_deps: Vec<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TransactionWithMetadata {
     pub hash: Option<B256>,
     #[serde(rename = "transactionType")]
@@ -39,6 +45,8 @@ pub struct TransactionWithMetadata {
     pub transaction: WithOtherFields<TransactionRequest>,
     pub additional_contracts: Vec<AdditionalContract>,
     pub is_fixed_gas_limit: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zk: Option<ZkTransaction>,
 }
 
 fn default_string() -> Option<String> {
@@ -58,6 +66,7 @@ impl TransactionWithMetadata {
         Self { transaction: WithOtherFields::new(transaction), ..Default::default() }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         transaction: TransactionRequest,
         rpc: String,
@@ -66,10 +75,12 @@ impl TransactionWithMetadata {
         decoder: &CallTraceDecoder,
         additional_contracts: Vec<AdditionalContract>,
         is_fixed_gas_limit: bool,
+        zk: Option<ZkTransaction>,
     ) -> Result<Self> {
         let mut metadata = Self::from_tx_request(transaction);
         metadata.rpc = rpc;
         metadata.is_fixed_gas_limit = is_fixed_gas_limit;
+        metadata.zk = zk;
 
         // Specify if any contract was directly created with this transaction
         if let Some(TxKind::Call(to)) = metadata.transaction.to {

@@ -27,12 +27,15 @@ env:
     </details>
 
 jobs:
-  update:
-    name: Update
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+    update:
+        name: Update
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+        steps:
+            - uses: actions/checkout@v4
+            - uses: dtolnay/rust-toolchain@nightly
+              with:
+                  toolchain: nightly-2023-09-30
 
       - name: cargo update
         # Remove first line that always just says "Updating crates.io index"

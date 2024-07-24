@@ -14,6 +14,8 @@ use alloy_serde::WithOtherFields;
 use eyre::Context;
 use foundry_common::{is_known_system_sender, SYSTEM_TRANSACTION_TYPE};
 pub use foundry_fork_db::{cache::BlockchainDbMeta, BlockchainDb, SharedBackend};
+use foundry_zksync_core::{convert::ConvertH160, L2_BASE_TOKEN_ADDRESS};
+use itertools::Itertools;
 use revm::{
     db::{CacheDB, DatabaseRef},
     inspectors::NoOpInspector,
@@ -44,6 +46,9 @@ pub use in_memory_db::{EmptyDBWrapper, FoundryEvmInMemoryDB, MemDb};
 mod snapshot;
 pub use snapshot::{BackendSnapshot, RevertSnapshotAction, StateSnapshot};
 
+mod fork_type;
+pub use fork_type::{CachedForkType, ForkType};
+
 // A `revm::Database` that is used in forking mode
 type ForkDB = CacheDB<SharedBackend>;
 
@@ -66,6 +71,14 @@ const DEFAULT_PERSISTENT_ACCOUNTS: [Address; 3] =
 /// a failed test.
 pub const GLOBAL_FAIL_SLOT: U256 =
     uint!(0x6661696c65640000000000000000000000000000000000000000000000000000_U256);
+
+/// Defines the info of a fork
+pub struct ForkInfo {
+    /// The type of fork
+    pub fork_type: ForkType,
+    /// The fork's environment
+    pub fork_env: Env,
+}
 
 /// An extension trait that allows us to easily extend the `revm::Inspector` capabilities
 #[auto_impl::auto_impl(&mut)]
@@ -272,6 +285,9 @@ pub trait DatabaseExt: Database<Error = DatabaseError> + DatabaseCommit {
     /// Returns true if the given account is currently marked as persistent.
     fn is_persistent(&self, acc: &Address) -> bool;
 
+    /// Returns the accounts currently marked as persistent.
+    fn persistent_accounts(&self) -> Vec<Address>;
+
     /// Revokes persistent status from the given account.
     fn remove_persistent_account(&mut self, account: &Address) -> bool;
 
@@ -433,7 +449,8 @@ pub struct Backend {
     active_fork_ids: Option<(LocalForkId, ForkLookupIndex)>,
     /// holds additional Backend data
     inner: BackendInner,
-}
+    /// Keeps track of the fork type
+    fork_url_type: CachedForkType,
 
 impl Backend {
     /// Creates a new Backend with a spawned multi fork thread.
@@ -464,6 +481,8 @@ impl Backend {
             fork_init_journaled_state: inner.new_journaled_state(),
             active_fork_ids: None,
             inner,
+            fork_url_type: Default::default(),
+            is_zk: false,
         };
 
         if let Some(fork) = fork {
@@ -502,6 +521,8 @@ impl Backend {
             fork_init_journaled_state: self.inner.new_journaled_state(),
             active_fork_ids: None,
             inner: Default::default(),
+            fork_url_type: Default::default(),
+            is_zk: false,
         }
     }
 
@@ -600,11 +621,13 @@ impl Backend {
         &self,
         active_journaled_state: &mut JournaledState,
         target_fork: &mut Fork,
+        merge_zk_db: bool,
     ) {
         self.update_fork_db_contracts(
             self.inner.persistent_accounts.iter().copied(),
             active_journaled_state,
             target_fork,
+            merge_zk_db,
         )
     }
 
@@ -614,11 +637,18 @@ impl Backend {
         accounts: impl IntoIterator<Item = Address>,
         active_journaled_state: &mut JournaledState,
         target_fork: &mut Fork,
+        merge_zk_db: bool,
     ) {
         if let Some(db) = self.active_fork_db() {
             merge_account_data(accounts, db, active_journaled_state, target_fork)
         } else {
-            merge_account_data(accounts, &self.mem_db, active_journaled_state, target_fork)
+            merge_account_data(
+                accounts,
+                &self.mem_db,
+                active_journaled_state,
+                target_fork,
+                merge_zk_db,
+            )
         }
     }
 
@@ -752,6 +782,18 @@ impl Backend {
         env.env = evm.context.evm.inner.env;
 
         Ok(res)
+    }
+
+    /// Executes the configured test call of the `env` without committing state changes
+    pub fn inspect_ref_zk(
+        &mut self,
+        env: &mut EnvWithHandlerCfg,
+        persisted_factory_deps: &mut HashMap<foundry_zksync_core::H256, Vec<u8>>,
+        factory_deps: Option<Vec<Vec<u8>>>,
+    ) -> eyre::Result<ResultAndState> {
+        self.initialize(env);
+
+        foundry_zksync_core::vm::transact(Some(persisted_factory_deps), factory_deps, env, self)
     }
 
     /// Returns true if the address is a precompile
@@ -891,6 +933,21 @@ impl Backend {
 }
 
 impl DatabaseExt for Backend {
+    fn get_fork_info(&mut self, id: LocalForkId) -> eyre::Result<ForkInfo> {
+        let fork_id = self.ensure_fork_id(id).cloned()?;
+        let fork_env = self
+            .forks
+            .get_env(fork_id.clone())?
+            .ok_or_else(|| eyre::eyre!("Requested fork `{}` does not exit", id))?;
+        let fork_type = self
+            .forks
+            .get_fork_url(fork_id)?
+            .map(|url| self.fork_url_type.get(&url))
+            .unwrap_or(ForkType::Zk);
+
+        Ok(ForkInfo { fork_type, fork_env })
+    }
+
     fn snapshot(&mut self, journaled_state: &JournaledState, env: &Env) -> U256 {
         trace!("create snapshot");
         let id = self.inner.snapshots.insert(BackendSnapshot::new(
@@ -1036,6 +1093,22 @@ impl DatabaseExt for Backend {
 
         let fork_id = self.ensure_fork_id(id).cloned()?;
         let idx = self.inner.ensure_fork_index(&fork_id)?;
+
+        let is_current_zk_fork = if let Some(active_fork_id) = self.active_fork_id() {
+            self.forks
+                .get_fork_url(self.ensure_fork_id(active_fork_id).cloned()?)?
+                .map(|url| self.fork_url_type.get(&url).is_zk())
+                .unwrap_or_default()
+        } else {
+            self.is_zk
+        };
+        let is_target_zk_fork = self
+            .forks
+            .get_fork_url(fork_id.clone())?
+            .map(|url| self.fork_url_type.get(&url).is_zk())
+            .unwrap_or_default();
+        let merge_zk_db = is_current_zk_fork && is_target_zk_fork;
+
         let fork_env = self
             .forks
             .get_env(fork_id)?
@@ -1103,7 +1176,7 @@ impl DatabaseExt for Backend {
                 caller_account.into()
             });
 
-            self.update_fork_db(active_journaled_state, &mut fork);
+            self.update_fork_db(active_journaled_state, &mut fork, merge_zk_db);
 
             // insert the fork back
             self.inner.set_fork(idx, fork);
@@ -1380,6 +1453,10 @@ impl DatabaseExt for Backend {
 
     fn is_persistent(&self, acc: &Address) -> bool {
         self.inner.persistent_accounts.contains(acc)
+    }
+
+    fn persistent_accounts(&self) -> Vec<Address> {
+        self.inner.persistent_accounts.clone().into_iter().collect_vec()
     }
 
     fn allow_cheatcode_access(&mut self, account: Address) -> bool {
@@ -1769,9 +1846,13 @@ pub(crate) fn merge_account_data<ExtDB: DatabaseRef>(
     active: &CacheDB<ExtDB>,
     active_journaled_state: &mut JournaledState,
     target_fork: &mut Fork,
+    merge_zk_db: bool,
 ) {
     for addr in accounts.into_iter() {
         merge_db_account_data(addr, active, &mut target_fork.db);
+        if merge_zk_db {
+            merge_zk_account_data(addr, active, &mut target_fork.db);
+        }
         merge_journaled_state_data(addr, active_journaled_state, &mut target_fork.journaled_state);
     }
 
@@ -1829,6 +1910,41 @@ fn merge_db_account_data<ExtDB: DatabaseRef>(
     }
 
     fork_db.accounts.insert(addr, acc);
+}
+
+/// Clones the zk account data from the `active` db into the `ForkDB`
+fn merge_zk_account_data<ExtDB: DatabaseRef>(
+    addr: Address,
+    active: &CacheDB<ExtDB>,
+    fork_db: &mut ForkDB,
+) {
+    trace!(?addr, "merging zk database data");
+
+    // TODO: do the same for nonce and codes
+    let balance_addr = L2_BASE_TOKEN_ADDRESS.to_address();
+    let mut acc = if let Some(acc) = active.accounts.get(&balance_addr).cloned() {
+        acc
+    } else {
+        // Account does not exist
+        return;
+    };
+
+    let mut balances = Map::<U256, U256>::default();
+    let slot = foundry_zksync_core::get_balance_key(addr);
+    if let Some(value) = acc.storage.get(&slot) {
+        balances.insert(slot, *value);
+    }
+
+    if let Some(fork_account) = fork_db.accounts.get_mut(&balance_addr) {
+        // This will merge the fork's tracked storage with active storage and update values
+        fork_account.storage.extend(balances);
+        // swap them so we can insert the account as whole in the next step
+        std::mem::swap(&mut fork_account.storage, &mut acc.storage);
+    } else {
+        std::mem::swap(&mut balances, &mut acc.storage)
+    }
+
+    fork_db.accounts.insert(balance_addr, acc);
 }
 
 /// Returns true of the address is a contract
@@ -1908,7 +2024,11 @@ fn apply_state_changeset(
     journaled_state: &mut JournaledState,
     fork: &mut Fork,
     persistent_accounts: &HashSet<Address>,
+<<<<<<< HEAD
 ) -> Result<(), BackendError> {
+=======
+) -> Result<(), DatabaseError> {
+>>>>>>> dev
     // commit the state and update the loaded accounts
     fork.db.commit(state);
 

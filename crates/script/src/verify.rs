@@ -48,6 +48,7 @@ pub struct VerifyBundle {
     pub retry: RetryArgs,
     pub verifier: VerifierArgs,
     pub via_ir: bool,
+    pub zksync: bool,
 }
 
 impl VerifyBundle {
@@ -75,6 +76,7 @@ impl VerifyBundle {
         };
 
         let via_ir = config.via_ir;
+        let zksync = config.zksync.should_compile();
 
         Self {
             num_of_optimizations,
@@ -84,6 +86,7 @@ impl VerifyBundle {
             retry,
             verifier,
             via_ir,
+            zksync,
         }
     }
 
@@ -150,6 +153,7 @@ impl VerifyBundle {
                     evm_version: None,
                     show_standard_json_input: false,
                     guess_constructor_args: false,
+                    zksync: self.zksync,
                 };
 
                 return Some(verify)

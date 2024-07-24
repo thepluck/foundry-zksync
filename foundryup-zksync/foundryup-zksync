@@ -82,10 +82,10 @@ main() {
     exit 0
   fi
 
-  FOUNDRYUP_REPO=${FOUNDRYUP_REPO:-foundry-rs/foundry}
+  FOUNDRYUP_REPO=${FOUNDRYUP_REPO:-matter-labs/foundry-zksync}
 
   # Install by downloading binaries
-  if [[ "$FOUNDRYUP_REPO" == "foundry-rs/foundry" && -z "$FOUNDRYUP_BRANCH" && -z "$FOUNDRYUP_COMMIT" ]]; then
+  if [[ "$FOUNDRYUP_REPO" == "matter-labs/foundry-zksync" && -z "$FOUNDRYUP_BRANCH" && -z "$FOUNDRYUP_COMMIT" ]]; then
     FOUNDRYUP_VERSION=${FOUNDRYUP_VERSION:-nightly}
     FOUNDRYUP_TAG=$FOUNDRYUP_VERSION
 
@@ -138,9 +138,9 @@ main() {
     MAN_TARBALL_URL="${RELEASE_URL}foundry_man_${FOUNDRYUP_VERSION}.tar.gz"
 
     # Download and extract the binaries archive
-    say "downloading latest forge, cast, anvil, and chisel"
+    say "downloading latest forge, and cast"
     if [ "$PLATFORM" = "win32" ]; then
-      tmp="$(mktemp -d 2>/dev/null || echo ".")/foundry.zip"
+      tmp="$(mktemp -d 2>/dev/null || echo ".")/foundry-zksync.zip"
       ensure download "$BIN_ARCHIVE_URL" "$tmp"
       ensure unzip "$tmp" -d "$FOUNDRY_BIN_DIR"
       rm -f "$tmp"
@@ -183,7 +183,7 @@ EOF
   # Install by cloning the repo with the provided branch/tag
   else
     need_cmd cargo
-    FOUNDRYUP_BRANCH=${FOUNDRYUP_BRANCH:-master}
+    FOUNDRYUP_BRANCH=${FOUNDRYUP_BRANCH:-dev}
     REPO_PATH="$FOUNDRY_DIR/$FOUNDRYUP_REPO"
 
     # If repo path does not exist, grab the author from the repo, make a directory in .foundry, cd to it and clone.
@@ -229,14 +229,16 @@ EOF
 
 usage() {
   cat 1>&2 <<EOF
-The installer for Foundry.
+The installer for Foundry-zksync.
 
-Update or revert to a specific Foundry version with ease.
+Update or revert to a specific Foundry-zksync version with ease.
+
+By default, the latest nightly version is installed from built binaries.
 
 By default, the latest nightly version is installed from built binaries.
 
 USAGE:
-    foundryup <OPTIONS>
+    foundryup-zksync <OPTIONS>
 
 OPTIONS:
     -h, --help      Print help information
@@ -253,7 +255,7 @@ EOF
 }
 
 say() {
-  printf "foundryup: %s\n" "$1"
+  printf "foundryup-zksync: %s\n" "$1"
 }
 
 warn() {
@@ -316,11 +318,17 @@ banner() {
 
 .xOx.xOx.xOx.xOx.xOx.xOx.xOx.xOx.xOx.xOx.xOx.xOx.xOx.xOx.xOx.xOx.xOx.xOx
 
+<<<<<<< HEAD:foundryup/foundryup
 Repo       : https://github.com/foundry-rs/
 Book       : https://book.getfoundry.sh/
 Chat       : https://t.me/foundry_rs/
 Support    : https://t.me/foundry_support/
 Contribute : https://github.com/orgs/foundry-rs/projects/2/
+=======
+Fork of    : https://github.com/foundry-rs/
+Repo       : https://github.com/foundry-zksync/
+Book       : https://book.getfoundry.sh/                                     
+>>>>>>> dev:foundryup-zksync/foundryup-zksync
 
 .xOx.xOx.xOx.xOx.xOx.xOx.xOx.xOx.xOx.xOx.xOx.xOx.xOx.xOx.xOx.xOx.xOx.xOx
 

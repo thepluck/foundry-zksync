@@ -26,6 +26,12 @@ use foundry_compilers::{
     utils::source_files_iter,
     ProjectCompileOutput,
 };
+use foundry_compilers::{
+    artifacts::output_selection::OutputSelection,
+    compilers::{multi::MultiCompilerLanguage, CompilerSettings, Language},
+    solc::SolcLanguage,
+    utils::source_files_iter,
+};
 use foundry_config::{
     figment,
     figment::{
@@ -36,6 +42,7 @@ use foundry_config::{
 };
 use foundry_debugger::Debugger;
 use foundry_evm::traces::identifier::TraceIdentifiers;
+use foundry_zksync_compiler::DualCompiledContracts;
 use regex::Regex;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -158,6 +165,10 @@ pub struct TestArgs {
     /// Print detailed test summary table.
     #[arg(long, help_heading = "Display options", requires = "summary")]
     pub detailed: bool,
+
+    /// Show test execution progress.
+    #[arg(long)]
+    pub show_progress: bool,
 }
 
 impl TestArgs {
@@ -292,6 +303,25 @@ impl TestArgs {
 
         let output = compiler.compile(&project)?;
 
+        let (zk_output, dual_compiled_contracts) = if config.zksync.should_compile() {
+            let zk_project = foundry_zksync_compiler::create_project(&config, config.cache, false)?;
+
+            let sources_to_compile =
+                self.get_sources_to_compile::<SolcLanguage>(&config, &filter)?;
+            let zk_compiler = ProjectCompiler::new()
+                .quiet_if(self.json || self.opts.silent)
+                .files(sources_to_compile);
+
+            let zk_output =
+                zk_compiler.zksync_compile(&zk_project, config.zksync.avoid_contracts())?;
+            let dual_compiled_contracts =
+                DualCompiledContracts::new(&output, &zk_output, &project.paths);
+
+            (Some(zk_output), Some(dual_compiled_contracts))
+        } else {
+            (None, None)
+        };
+
         // Create test options from general project settings and compiler output.
         let project_root = &project.paths.root;
         let toml = config.get_config_path();
@@ -326,7 +356,12 @@ impl TestArgs {
 
         // Prepare the test builder.
         let should_debug = self.debug.is_some();
+
+        // Clone the output only if we actually need it later for the debugger.
+        let output_clone = should_debug.then(|| output.clone());
+
         let config = Arc::new(config);
+
         let runner = MultiContractRunnerBuilder::new(config.clone())
             .set_debug(should_debug)
             .set_decode_internal(decode_internal)
@@ -334,9 +369,16 @@ impl TestArgs {
             .evm_spec(config.evm_spec_id())
             .sender(evm_opts.sender)
             .with_fork(evm_opts.get_fork(&config, env.clone()))
-            .with_test_options(test_options)
+            .with_test_options(test_options.clone())
             .enable_isolation(evm_opts.isolate)
-            .build(project_root, &output, env, evm_opts)?;
+            .build(
+                project_root,
+                output,
+                zk_output,
+                env,
+                evm_opts,
+                dual_compiled_contracts.unwrap_or_default(),
+            )?;
 
         let mut maybe_override_mt = |flag, maybe_regex: Option<&Regex>| {
             if let Some(regex) = maybe_regex {

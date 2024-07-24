@@ -181,12 +181,18 @@ casttest!(wallet_private_key_from_mnemonic_arg, |_prj, cmd| {
         "private-key",
         "test test test test test test test test test test test junk",
         "1",
+<<<<<<< HEAD
     ])
     .assert_success()
     .stdout_eq(str![[r#"
 0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d
 
 "#]]);
+=======
+    ]);
+    let output = cmd.stdout_lossy();
+    assert_eq!(output.trim(), "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d");
+>>>>>>> dev
 });
 
 // tests that `cast wallet private-key` with options outputs the private key

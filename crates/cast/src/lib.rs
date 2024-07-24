@@ -1990,6 +1990,7 @@ impl SimpleCast {
         let tx_hex = hex::decode(strip_0x(tx))?;
         let tx = TxEnvelope::decode_2718(&mut tx_hex.as_slice())?;
         Ok(tx)
+<<<<<<< HEAD
     }
 
     /// Decodes EOF container bytes
@@ -2008,6 +2009,8 @@ impl SimpleCast {
         let eof_hex = hex::decode(eof)?;
         let eof = Eof::decode(eof_hex.into())?;
         Ok(pretty_eof(&eof)?)
+=======
+>>>>>>> dev
     }
 }
 

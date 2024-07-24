@@ -32,6 +32,8 @@ pub struct FuzzConfig {
     pub failure_persist_file: Option<String>,
     /// show `console.log` in fuzz test, defaults to `false`
     pub show_logs: bool,
+    /// When enabled, filters all addresses below 2^16, as they are reserved in zkSync.
+    pub no_zksync_reserved_addresses: bool,
 }
 
 impl Default for FuzzConfig {
@@ -45,6 +47,7 @@ impl Default for FuzzConfig {
             failure_persist_dir: None,
             failure_persist_file: None,
             show_logs: false,
+            no_zksync_reserved_addresses: false,
         }
     }
 }
@@ -61,6 +64,7 @@ impl FuzzConfig {
             failure_persist_dir: Some(cache_dir),
             failure_persist_file: Some("failures".to_string()),
             show_logs: false,
+            no_zksync_reserved_addresses: false,
         }
     }
 }
@@ -90,6 +94,9 @@ impl InlineConfigParser for FuzzConfig {
                 }
                 "failure-persist-file" => conf_clone.failure_persist_file = Some(value),
                 "show-logs" => conf_clone.show_logs = parse_config_bool(key, value)?,
+                "no-zksync-reserved-addresses" => {
+                    conf_clone.no_zksync_reserved_addresses = parse_config_bool(key, value)?
+                }
                 _ => Err(InlineConfigParserError::InvalidConfigProperty(key))?,
             }
         }

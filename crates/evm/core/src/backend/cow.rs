@@ -226,6 +226,10 @@ impl<'a> DatabaseExt for CowBackend<'a> {
         self.backend.is_persistent(acc)
     }
 
+    fn persistent_accounts(&self) -> Vec<Address> {
+        self.backend.persistent_accounts()
+    }
+
     fn remove_persistent_account(&mut self, account: &Address) -> bool {
         self.backend.to_mut().remove_persistent_account(account)
     }

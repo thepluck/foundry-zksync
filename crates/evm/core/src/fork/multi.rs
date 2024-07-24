@@ -509,7 +509,9 @@ impl Drop for ShutDownMultiFork {
 ///
 /// This will establish a new `Provider` to the endpoint and return the Fork Backend.
 async fn create_fork(mut fork: CreateFork) -> eyre::Result<(ForkId, CreatedFork, Handler)> {
-    let provider = Arc::new(
+    let provider: Arc<
+        RootProvider<RetryBackoffService<RuntimeTransport>, alloy_provider::network::AnyNetwork>,
+    > = Arc::new(
         ProviderBuilder::new(fork.url.as_str())
             .maybe_max_retry(fork.evm_opts.fork_retries)
             .maybe_initial_backoff(fork.evm_opts.fork_retry_backoff)
@@ -539,4 +541,28 @@ async fn create_fork(mut fork: CreateFork) -> eyre::Result<(ForkId, CreatedFork,
     let fork_id = ForkId::new(&fork.opts.url, number.into());
 
     Ok((fork_id, fork, handler))
+}
+
+impl<T: alloy_transport::Transport + Clone> super::backend::ZkSyncMiddleware
+    for RootProvider<T, alloy_provider::network::AnyNetwork>
+{
+    async fn get_bytecode_by_hash(
+        &self,
+        hash: alloy_primitives::B256,
+    ) -> TransportResult<Option<revm::primitives::Bytecode>> {
+        let bytecode: Option<alloy_primitives::Bytes> =
+            self.raw_request("zks_getBytecodeByHash".into(), vec![hash]).await?;
+        Ok(bytecode.map(revm::primitives::Bytecode::new_raw))
+    }
+}
+
+impl<T: alloy_transport::Transport + Clone> super::backend::ZkSyncMiddleware
+    for Arc<RootProvider<T, alloy_provider::network::AnyNetwork>>
+{
+    async fn get_bytecode_by_hash(
+        &self,
+        hash: alloy_primitives::B256,
+    ) -> TransportResult<Option<revm::primitives::Bytecode>> {
+        self.as_ref().get_bytecode_by_hash(hash).await
+    }
 }

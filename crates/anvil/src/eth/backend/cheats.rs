@@ -1,6 +1,7 @@
 //! Support for "cheat codes" / bypass functions
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, Signature};
+use anvil_core::eth::transaction::impersonated_signature;
 use parking_lot::RwLock;
 use std::{collections::HashSet, sync::Arc};
 
