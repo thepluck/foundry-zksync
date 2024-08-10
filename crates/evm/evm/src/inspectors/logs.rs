@@ -32,6 +32,8 @@ impl LogCollector {
             Err(err) => return (InstructionResult::Revert, err.abi_encode_revert()),
         };
 
+        let str = decoded.fmt(Default::default());
+        println!("matched log decoded: {str}");
         // Convert the decoded call to a DS `log(string)` event
         self.logs.push(convert_hh_log_to_event(decoded));
 
@@ -50,7 +52,10 @@ impl<DB: Database> Inspector<DB> for LogCollector {
         _context: &mut EvmContext<DB>,
         inputs: &mut CallInputs,
     ) -> Option<CallOutcome> {
+        println!("intercepted by log collector");
         if inputs.target_address == HARDHAT_CONSOLE_ADDRESS {
+            println!("matched a log");
+            println!("{inputs:?}");
             let (res, out) = self.hardhat_log(inputs.input.to_vec());
             if res != InstructionResult::Continue {
                 return Some(CallOutcome {

@@ -941,6 +941,11 @@ fn convert_executed_result(
     let InspectorData { mut logs, labels, traces, coverage, cheatcodes, chisel_state } =
         inspector.collect();
 
+    println!("logs ({}): {:?}", logs.len(), logs);
+    for l in combined_logs.clone().unwrap() {
+        println!("{l:?}");
+    }
+
     let logs = match combined_logs {
         Some(combined_logs) => {
             let new_logs = combined_logs
