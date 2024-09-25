@@ -1,24 +1,26 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
-import "../lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
+import "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import "forge-std/console2.sol";
 
 import {
     IPaymaster,
     ExecutionResult,
     PAYMASTER_VALIDATION_SUCCESS_MAGIC
-} from "../lib/zksync-contracts/zksync-contracts/l2/system-contracts/interfaces/IPaymaster.sol";
+} from "era-contracts/system-contracts/contracts/interfaces/IPaymaster.sol";
 import {IPaymasterFlow} from
-    "../lib/zksync-contracts/zksync-contracts/l2/system-contracts/interfaces/IPaymasterFlow.sol";
+    "era-contracts/system-contracts/contracts/interfaces/IPaymasterFlow.sol";
 import {
     TransactionHelper,
     Transaction
-} from "../lib/zksync-contracts/zksync-contracts/l2/system-contracts/libraries/TransactionHelper.sol";
-import "../lib/openzeppelin-contracts/contracts/token/ERC20/ERC20.sol";
-import "../lib/zksync-contracts/zksync-contracts/l2/system-contracts/Constants.sol";
+} from "era-contracts/system-contracts/contracts/libraries/TransactionHelper.sol";
+import "openzeppelin-contracts/contracts/token/ERC20/ERC20.sol";
 
 contract MyPaymaster is IPaymaster {
+    // TODO: Replace this once the following issue is fixed:
+    // https://github.com/matter-labs/era-contracts/issues/802
+    address payable constant BOOTLOADER_FORMAL_ADDRESS = payable(address(0x8000 + 0x01));
     uint256 constant PRICE_FOR_PAYING_FEES = 1;
 
     address public allowedToken;

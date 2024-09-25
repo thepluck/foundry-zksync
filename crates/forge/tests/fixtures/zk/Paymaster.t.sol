@@ -2,7 +2,6 @@
 pragma solidity ^0.8.13;
 
 import {Test, console} from "forge-std/Test.sol";
-import "../lib/zksync-contracts/zksync-contracts/l2/system-contracts/Constants.sol";
 import {MyPaymaster, MyERC20} from "./MyPaymaster.sol";
 
 contract TestPaymasterFlow is Test {
@@ -80,6 +79,7 @@ contract TestPaymasterFlow is Test {
 }
 
 contract DoStuff {
+    address payable constant BOOTLOADER_FORMAL_ADDRESS = payable(address(0x8000 + 0x01));
     function do_stuff() public {
         (bool success,) = payable(BOOTLOADER_FORMAL_ADDRESS).call{value: address(this).balance}("");
         require(success, "Failed to transfer tx fee to the bootloader. Paymaster balance might not be enough.");
