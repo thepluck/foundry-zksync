@@ -1,22 +1,24 @@
+use super::{runner::ScriptRunner, JsonResult, NestedValue, ScriptResult};
 use crate::{
     build::{CompiledState, LinkedBuildData},
     simulate::PreSimulationState,
     ScriptArgs, ScriptConfig,
 };
-
-use super::{runner::ScriptRunner, JsonResult, NestedValue, ScriptResult};
 use alloy_dyn_abi::FunctionExt;
 use alloy_json_abi::{Function, InternalType, JsonAbi};
-use alloy_primitives::{Address, Bytes};
+use alloy_primitives::{
+    map::{HashMap, HashSet},
+    Address, Bytes,
+};
 use alloy_provider::Provider;
-use async_recursion::async_recursion;
+use alloy_rpc_types::TransactionInput;
 use eyre::{OptionExt, Result};
-use foundry_cheatcodes::ScriptWallets;
+use foundry_cheatcodes::Wallets;
 use foundry_cli::utils::{ensure_clean_constructor, needs_setup};
 use foundry_common::{
     fmt::{format_token, format_token_raw},
     provider::get_http_provider,
-    shell, ContractsByArtifact,
+    ContractsByArtifact,
 };
 use foundry_config::{Config, NamedChain};
 use foundry_debugger::Debugger;
@@ -31,7 +33,7 @@ use foundry_evm::{
 };
 use futures::future::join_all;
 use itertools::Itertools;
-use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use yansi::Paint;
 
 /// State after linking, contains the linked build data along with library addresses and optional
@@ -39,7 +41,7 @@ use yansi::Paint;
 pub struct LinkedState {
     pub args: ScriptArgs,
     pub script_config: ScriptConfig,
-    pub script_wallets: ScriptWallets,
+    pub script_wallets: Wallets,
     pub build_data: LinkedBuildData,
 }
 
@@ -91,7 +93,7 @@ impl LinkedState {
 pub struct PreExecutionState {
     pub args: ScriptArgs,
     pub script_config: ScriptConfig,
-    pub script_wallets: ScriptWallets,
+    pub script_wallets: Wallets,
     pub build_data: LinkedBuildData,
     pub execution_data: ExecutionData,
 }
@@ -99,7 +101,6 @@ pub struct PreExecutionState {
 impl PreExecutionState {
     /// Executes the script and returns the state after execution.
     /// Might require executing script twice in cases when we determine sender from execution.
-    #[async_recursion]
     pub async fn execute(mut self) -> Result<ExecutedState> {
         let mut runner = self
             .script_config
@@ -126,7 +127,7 @@ impl PreExecutionState {
                 build_data: self.build_data.build_data,
             };
 
-            return state.link().await?.prepare_execution().await?.execute().await;
+            return Box::pin(state.link().await?.prepare_execution().await?.execute()).await;
         }
 
         Ok(ExecutedState {
@@ -188,14 +189,14 @@ impl PreExecutionState {
         if let Some(txs) = transactions {
             // If the user passed a `--sender` don't check anything.
             if self.build_data.predeploy_libraries.libraries_count() > 0 &&
-                self.args.evm_opts.sender.is_none()
+                self.args.evm.sender.is_none()
             {
                 for tx in txs.iter() {
-                    if tx.transaction.to.is_none() {
-                        let sender = tx.transaction.from.expect("no sender");
+                    if tx.transaction.to().is_none() {
+                        let sender = tx.transaction.from().expect("no sender");
                         if let Some(ns) = new_sender {
                             if sender != ns {
-                                shell::println("You have more than one deployer who could predeploy libraries. Using `--sender` instead.")?;
+                                sh_warn!("You have more than one deployer who could predeploy libraries. Using `--sender` instead.")?;
                                 return Ok(None);
                             }
                         } else if sender != self.script_config.evm_opts.sender {
@@ -254,7 +255,7 @@ For more information, please see https://eips.ethereum.org/EIPS/eip-3855",
                     .map(|(_, chain)| *chain as u64)
                     .format(", ")
             );
-            shell::println(msg.yellow())?;
+            sh_warn!("{msg}")?;
         }
         Ok(())
     }
@@ -274,7 +275,7 @@ pub struct ExecutionArtifacts {
 pub struct ExecutedState {
     pub args: ScriptArgs,
     pub script_config: ScriptConfig,
-    pub script_wallets: ScriptWallets,
+    pub script_wallets: Wallets,
     pub build_data: LinkedBuildData,
     pub execution_data: ExecutionData,
     pub execution_result: ScriptResult,
@@ -287,14 +288,20 @@ impl ExecutedState {
 
         let decoder = self.build_trace_decoder(&self.build_data.known_contracts).await?;
 
-        let txs = self.execution_result.transactions.clone().unwrap_or_default();
+        let mut txs = self.execution_result.transactions.clone().unwrap_or_default();
+
+        // Ensure that unsigned transactions have both `data` and `input` populated to avoid
+        // issues with eth_estimateGas and eth_sendTransaction requests.
+        for tx in &mut txs {
+            if let Some(req) = tx.transaction.as_unsigned_mut() {
+                req.input =
+                    TransactionInput::maybe_both(std::mem::take(&mut req.input).into_input());
+            }
+        }
         let rpc_data = RpcData::from_transactions(&txs);
 
         if rpc_data.is_multi_chain() {
-            shell::eprintln(format!(
-                "{}",
-                "Multi chain deployment is still under development. Use with caution.".yellow()
-            ))?;
+            sh_warn!("Multi chain deployment is still under development. Use with caution.")?;
             if !self.build_data.libraries.is_empty() {
                 eyre::bail!(
                     "Multi chain deployment does not support library linking at the moment."
@@ -334,14 +341,6 @@ impl ExecutedState {
             self.script_config.evm_opts.get_remote_chain_id().await,
         )?;
 
-        // Decoding traces using etherscan is costly as we run into rate limits,
-        // causing scripts to run for a very long time unnecessarily.
-        // Therefore, we only try and use etherscan if the user has provided an API key.
-        let should_use_etherscan_traces = self.script_config.config.etherscan_api_key.is_some();
-        if !should_use_etherscan_traces {
-            identifier.etherscan = None;
-        }
-
         for (_, trace) in &self.execution_result.traces {
             decoder.identify(trace, &mut identifier);
         }
@@ -351,7 +350,7 @@ impl ExecutedState {
 
     /// Collects the return values from the execution result.
     fn get_returns(&self) -> Result<HashMap<String, NestedValue>> {
-        let mut returns = HashMap::new();
+        let mut returns = HashMap::default();
         let returned = &self.execution_result.returned;
         let func = &self.execution_data.func;
 
@@ -380,7 +379,7 @@ impl ExecutedState {
                 }
             }
             Err(_) => {
-                shell::println(format!("{returned:?}"))?;
+                sh_err!("Failed to decode return value: {:x?}", returned)?;
             }
         }
 
@@ -392,14 +391,13 @@ impl PreSimulationState {
     pub fn show_json(&self) -> Result<()> {
         let result = &self.execution_result;
 
-        let console_logs = decode_console_logs(&result.logs);
-        let output = JsonResult {
-            logs: console_logs,
-            gas_used: result.gas_used,
-            returns: self.execution_artifacts.returns.clone(),
+        let json_result = JsonResult {
+            logs: decode_console_logs(&result.logs),
+            returns: &self.execution_artifacts.returns,
+            result,
         };
-        let j = serde_json::to_string(&output)?;
-        shell::println(j)?;
+        let json = serde_json::to_string(&json_result)?;
+        sh_println!("{json}")?;
 
         if !self.execution_result.success {
             return Err(eyre::eyre!(
@@ -422,7 +420,7 @@ impl PreSimulationState {
                 warn!(verbosity, "no traces");
             }
 
-            shell::println("Traces:")?;
+            sh_println!("Traces:")?;
             for (kind, trace) in &result.traces {
                 let should_include = match kind {
                     TraceKind::Setup => verbosity >= 5,
@@ -433,22 +431,22 @@ impl PreSimulationState {
                 if should_include {
                     let mut trace = trace.clone();
                     decode_trace_arena(&mut trace, decoder).await?;
-                    shell::println(render_trace_arena(&trace))?;
+                    sh_println!("{}", render_trace_arena(&trace))?;
                 }
             }
-            shell::println(String::new())?;
+            sh_println!()?;
         }
 
         if result.success {
-            shell::println(format!("{}", "Script ran successfully.".green()))?;
+            sh_println!("{}", "Script ran successfully.".green())?;
         }
 
         if self.script_config.evm_opts.fork_url.is_none() {
-            shell::println(format!("Gas used: {}", result.gas_used))?;
+            sh_println!("Gas used: {}", result.gas_used)?;
         }
 
         if result.success && !result.returned.is_empty() {
-            shell::println("\n== Return ==")?;
+            sh_println!("\n== Return ==")?;
             match func.abi_decode_output(&result.returned, false) {
                 Ok(decoded) => {
                     for (index, (token, output)) in decoded.iter().zip(&func.outputs).enumerate() {
@@ -463,24 +461,24 @@ impl PreSimulationState {
                         } else {
                             index.to_string()
                         };
-                        shell::println(format!(
-                            "{}: {internal_type} {}",
-                            label.trim_end(),
-                            format_token(token)
-                        ))?;
+                        sh_println!(
+                            "{label}: {internal_type} {value}",
+                            label = label.trim_end(),
+                            value = format_token(token)
+                        )?;
                     }
                 }
                 Err(_) => {
-                    shell::println(format!("{:x?}", (&result.returned)))?;
+                    sh_err!("{:x?}", (&result.returned))?;
                 }
             }
         }
 
         let console_logs = decode_console_logs(&result.logs);
         if !console_logs.is_empty() {
-            shell::println("\n== Logs ==")?;
+            sh_println!("\n== Logs ==")?;
             for log in console_logs {
-                shell::println(format!("  {log}"))?;
+                sh_println!("  {log}")?;
             }
         }
 
@@ -495,7 +493,17 @@ impl PreSimulationState {
     }
 
     pub fn run_debugger(self) -> Result<()> {
-        let mut debugger = Debugger::builder()
+        self.create_debugger().try_run_tui()?;
+        Ok(())
+    }
+
+    pub fn dump_debugger(self, path: &Path) -> Result<()> {
+        self.create_debugger().dump_to_file(path)?;
+        Ok(())
+    }
+
+    fn create_debugger(self) -> Debugger {
+        Debugger::builder()
             .traces(
                 self.execution_result
                     .traces
@@ -506,8 +514,6 @@ impl PreSimulationState {
             .decoder(&self.execution_artifacts.decoder)
             .sources(self.build_data.sources)
             .breakpoints(self.execution_result.breakpoints)
-            .build();
-        debugger.try_run()?;
-        Ok(())
+            .build()
     }
 }

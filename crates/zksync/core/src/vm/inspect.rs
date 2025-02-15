@@ -1,20 +1,10 @@
-use alloy_primitives::{hex, Log};
-use era_test_node::{
-    config::node::ShowCalls,
-    formatter,
-    system_contracts::{Options, SystemContracts},
-    utils::bytecode_to_factory_dep,
+use alloy_primitives::{hex, FixedBytes, Log};
+use anvil_zksync_config::types::SystemContractsOptions as Options;
+use anvil_zksync_core::{
+    formatter::Formatter, system_contracts::SystemContracts, utils::bytecode_to_factory_dep,
 };
+use anvil_zksync_types::ShowCalls;
 use itertools::Itertools;
-use multivm::{
-    interface::{Halt, VmInterface, VmRevertReason},
-    tracers::CallTracer,
-    vm_latest::{
-        ExecutionResult, HistoryDisabled, ToTracerPointer, Vm, VmExecutionMode,
-        VmExecutionResultAndLogs,
-    },
-};
-use once_cell::sync::OnceCell;
 use revm::{
     db::states::StorageSlot,
     primitives::{
@@ -26,18 +16,33 @@ use revm::{
 };
 use tracing::{debug, error, info, trace, warn};
 use zksync_basic_types::{ethabi, L2ChainId, Nonce, H160, H256, U256};
-use zksync_state::{ReadStorage, StoragePtr, WriteStorage};
-use zksync_types::{
-    l2::L2Tx, vm_trace::Call, PackedEthSignature, StorageKey, Transaction, VmEvent,
-    ACCOUNT_CODE_STORAGE_ADDRESS, CONTRACT_DEPLOYER_ADDRESS,
+use zksync_multivm::{
+    interface::{
+        Call, CallType, ExecutionResult, Halt, InspectExecutionMode, VmEvent,
+        VmExecutionResultAndLogs, VmFactory, VmInterface, VmRevertReason,
+    },
+    tracers::CallTracer,
+    vm_latest::{HistoryDisabled, ToTracerPointer, Vm},
 };
-use zksync_utils::{be_words_to_bytes, h256_to_account_address, h256_to_u256, u256_to_h256};
+use zksync_types::{
+    get_nonce_key, h256_to_address, h256_to_u256, l2::L2Tx, transaction_request::PaymasterParams,
+    u256_to_h256, PackedEthSignature, StorageKey, Transaction, ACCOUNT_CODE_STORAGE_ADDRESS,
+    CONTRACT_DEPLOYER_ADDRESS,
+};
+use zksync_vm_interface::storage::{ReadStorage, StoragePtr, WriteStorage};
 
-use std::{collections::HashMap, fmt::Debug, sync::Arc};
+use core::convert::Into;
+use std::{
+    collections::HashMap,
+    fmt::Debug,
+    sync::{Arc, LazyLock},
+};
 
 use crate::{
-    convert::{ConvertAddress, ConvertH160, ConvertH256, ConvertU256},
-    is_system_address,
+    be_words_to_bytes,
+    convert::{ConvertAddress, ConvertH160, ConvertH256, ConvertRU256, ConvertU256},
+    fix_l2_gas_limit, fix_l2_gas_price, increment_tx_nonce, is_system_address,
+    state::{new_full_nonce, parse_full_nonce, FullNonce},
     vm::{
         db::{ZKVMData, DEFAULT_CHAIN_ID},
         env::{create_l1_batch_env, create_system_env},
@@ -49,12 +54,10 @@ use crate::{
         },
     },
 };
-use foundry_evm_abi::{
-    patch_hh_console_selector, Console, HardhatConsole, HARDHAT_CONSOLE_ADDRESS,
-};
 
-/// Minimum gas price allowed for L1.
-const MIN_L1_GAS_PRICE: u64 = 1000;
+use foundry_evm_abi::console::{self, ds::Console};
+
+use super::HARDHAT_CONSOLE_ADDRESS;
 
 /// Represents the result of execution a [`L2Tx`] on EraVM
 #[derive(Debug)]
@@ -65,6 +68,8 @@ pub struct ZKVMExecutionResult {
     pub execution_result: rExecutionResult,
     /// Call traces
     pub call_traces: Vec<Call>,
+    /// Immutables recorded via calls to ImmutableSimulator::setImmutables.
+    pub recorded_immutables: rHashMap<H160, rHashMap<rU256, FixedBytes<32>>>,
 }
 
 /// Revm-style result with ZKVM Execution
@@ -75,7 +80,7 @@ pub type ZKVMResult<E> = EVMResultGeneric<ZKVMExecutionResult, E>;
 /// Will handle aggregating execution results, where errors, reverts or halts will be propagated
 /// immediately.
 /// All logs will be collected as they happen, and returned with the final result.
-//TODO: should we make this transparent in `inspect` directly?
+// TODO: should we make this transparent in `inspect` directly?
 pub fn inspect_as_batch<DB, E>(
     tx: L2Tx,
     ecx: &mut EvmContext<DB>,
@@ -91,15 +96,16 @@ where
     let mut aggregated_result: Option<ZKVMExecutionResult> = None;
 
     for (idx, mut tx) in txns.into_iter().enumerate() {
-        let gas_used = aggregated_result
-            .as_ref()
-            .map(|r| r.execution_result.gas_used())
-            .map(U256::from)
-            .unwrap_or_default();
+        // cap gas limit so that we do not set a number greater than
+        // remaining sender balance
+        let (new_gas_limit, _) = gas_params(
+            ecx,
+            tx.common_data.initiator_address.to_address(),
+            &tx.common_data.paymaster_params,
+        );
+        tx.common_data.fee.gas_limit = new_gas_limit;
 
-        //deducted gas used so far
-        tx.common_data.fee.gas_limit -= gas_used;
-
+        let initiator_address = tx.initiator_account();
         info!("executing batched tx ({}/{})", idx + 1, total_txns);
         let mut result = inspect(tx, ecx, ccx, call_ctx.clone())?;
 
@@ -109,6 +115,7 @@ where
                     logs: result.logs,
                     call_traces: result.call_traces,
                     execution_result: exec,
+                    recorded_immutables: result.recorded_immutables,
                 });
             }
             (None, exec) => {
@@ -116,6 +123,7 @@ where
                     logs: result.logs,
                     call_traces: result.call_traces,
                     execution_result: exec,
+                    recorded_immutables: result.recorded_immutables,
                 });
             }
             (
@@ -130,11 +138,13 @@ where
                             logs: agg_logs,
                             output: agg_output,
                         },
+                    recorded_immutables: aggregated_recorded_immutables,
                 }),
                 rExecutionResult::Success { reason, gas_used, gas_refunded, logs, output },
             ) => {
                 aggregated_logs.append(&mut result.logs);
                 aggregated_call_traces.append(&mut result.call_traces);
+                aggregated_recorded_immutables.extend(result.recorded_immutables);
                 *agg_reason = reason;
                 *agg_gas_used += gas_used;
                 *agg_gas_refunded += gas_refunded;
@@ -142,6 +152,11 @@ where
                 *agg_output = output;
             }
             _ => unreachable!("aggregated result must only contain success"),
+        }
+
+        // Increment the nonce manually if there are multiple batches
+        if total_txns > 1 {
+            increment_tx_nonce(initiator_address.to_address(), ecx);
         }
     }
 
@@ -178,8 +193,9 @@ where
         .with_extra_factory_deps(persisted_factory_deps)
         .with_storage_accesses(ccx.accesses.take());
 
-    let is_create = call_ctx.is_create;
     info!(?call_ctx, "executing transaction in zk vm");
+
+    let initiator_address = tx.common_data.initiator_address;
 
     if tx.common_data.signature.is_empty() {
         // FIXME: This is a hack to make sure that the signature is not empty.
@@ -194,11 +210,12 @@ where
     let InnerZkVmResult {
         tx_result,
         bytecodes,
-        modified_storage,
+        mut modified_storage,
         call_traces,
+        recorded_immutables,
         create_outcome,
         gas_usage,
-    } = inspect_inner(tx, storage_ptr, chain_id, ccx, call_ctx);
+    } = inspect_inner(tx, storage_ptr, chain_id, ccx, call_ctx.clone());
 
     info!(
         reserved=?gas_usage.bootloader_debug.reserved_gas, limit=?gas_usage.limit, execution=?gas_usage.execution, pubdata=?gas_usage.pubdata, refunded=?gas_usage.refunded,
@@ -235,13 +252,13 @@ where
             info!("zk vm decoded result {}", hex::encode(&result));
 
             let address = if result.len() == 32 {
-                Some(h256_to_account_address(&H256::from_slice(&result)))
+                Some(h256_to_address(&H256::from_slice(&result)))
             } else {
                 None
             };
             // in zkEVM the output is the 0-padded address, we replace this with the deployed
             // bytecode so the traces can pick it up correctly
-            let output = if is_create {
+            let output = if call_ctx.is_create {
                 let create_result = match (address, create_outcome) {
                     (Some(address), Some(create_outcome)) => {
                         if address == create_outcome.address {
@@ -267,6 +284,7 @@ where
                     logs,
                     output,
                 },
+                recorded_immutables,
             }
         }
         ExecutionResult::Revert { output } => {
@@ -283,6 +301,7 @@ where
                     gas_used: gas_usage.gas_used(),
                     output: Bytes::from(output),
                 },
+                recorded_immutables,
             }
         }
         ExecutionResult::Halt { reason } => {
@@ -299,6 +318,7 @@ where
                     reason: mapped_reason,
                     gas_used: gas_usage.gas_used(),
                 },
+                recorded_immutables,
             }
         }
     };
@@ -316,16 +336,30 @@ where
 
     let mut storage: rHashMap<Address, rHashMap<rU256, StorageSlot>> = Default::default();
     let mut codes: rHashMap<Address, (B256, Bytecode)> = Default::default();
-    for (k, v) in &modified_storage {
+
+    let initiator_nonce_key = get_nonce_key(&initiator_address);
+
+    // NOTE(zk): We need to revert the tx nonce of the initiator as we intercept and dispatch
+    // CALLs and CREATEs to the zkEVM. The CREATEs always increment the deployment nonce
+    // which must be persisted, but the tx nonce increase must be reverted.
+    if let Some(initiator_nonce) = modified_storage.get_mut(&initiator_nonce_key) {
+        let FullNonce { tx_nonce, deploy_nonce } = parse_full_nonce(initiator_nonce.to_ru256());
+        let new_tx_nonce = tx_nonce.saturating_sub(1);
+        trace!(address=?initiator_address, from=?tx_nonce, to=?new_tx_nonce, deploy_nonce, "reverting initiator tx nonce for CALL");
+        *initiator_nonce = new_full_nonce(new_tx_nonce, deploy_nonce).to_h256();
+    }
+
+    for (k, v) in modified_storage {
         let address = k.address().to_address();
         let index = k.key().to_ru256();
         era_db.load_account(address);
         let previous = era_db.sload(address, index);
         let entry = storage.entry(address).or_default();
+
         entry.insert(index, StorageSlot::new_changed(previous, v.to_ru256()));
 
         if k.address() == &ACCOUNT_CODE_STORAGE_ADDRESS {
-            if let Some(bytecode) = bytecodes.get(&h256_to_u256(*v)) {
+            if let Some(bytecode) = bytecodes.get(&h256_to_u256(v)) {
                 let bytecode =
                     bytecode.iter().flat_map(|x| u256_to_h256(*x).to_fixed_bytes()).collect_vec();
                 let bytecode = Bytecode::new_raw(Bytes::from(bytecode));
@@ -334,14 +368,14 @@ where
             } else {
                 // We populate bytecodes for all non-system addresses
                 if !is_system_address(k.key().to_h160().to_address()) {
-                    if let Some(bytecode) = (&mut era_db).load_factory_dep(*v) {
+                    if let Some(bytecode) = (&mut era_db).load_factory_dep(v) {
                         let hash = B256::from_slice(v.as_bytes());
                         let bytecode = Bytecode::new_raw(Bytes::from(bytecode));
                         codes.insert(k.key().to_h160().to_address(), (hash, bytecode));
                     } else {
                         warn!(
                             "no bytecode was found for {:?}, requested by account {:?}",
-                            *v,
+                            v,
                             k.key().to_h160()
                         );
                     }
@@ -369,6 +403,37 @@ where
     }
 
     Ok(execution_result)
+}
+
+/// Assign gas parameters that satisfy zkSync's fee model.
+pub fn gas_params<DB>(
+    ecx: &mut EvmContext<DB>,
+    caller: Address,
+    paymaster_params: &PaymasterParams,
+) -> (U256, U256)
+where
+    DB: Database,
+    <DB as Database>::Error: Debug,
+{
+    let value = ecx.env.tx.value.to_u256();
+    let use_paymaster = !paymaster_params.paymaster.is_zero();
+
+    // Get balance of either paymaster or caller depending on who's paying
+    let address = if use_paymaster {
+        Address::from_slice(paymaster_params.paymaster.as_bytes())
+    } else {
+        caller
+    };
+    let balance = ZKVMData::new(ecx).get_balance(address);
+
+    if balance.is_zero() {
+        error!("balance is 0 for {}, transaction will fail", address.to_h160());
+    }
+
+    let max_fee_per_gas = fix_l2_gas_price(ecx.env.tx.gas_price.to_u256());
+
+    let gas_limit = fix_l2_gas_limit(ecx.env.tx.gas_limit.into(), max_fee_per_gas, value, balance);
+    (gas_limit, max_fee_per_gas)
 }
 
 #[allow(dead_code)]
@@ -407,6 +472,7 @@ struct InnerZkVmResult {
     call_traces: Vec<Call>,
     create_outcome: Option<InnerCreateOutcome>,
     gas_usage: ZkVmGasUsage,
+    recorded_immutables: rHashMap<H160, rHashMap<rU256, FixedBytes<32>>>,
 }
 
 fn inspect_inner<S: ReadStorage>(
@@ -416,20 +482,20 @@ fn inspect_inner<S: ReadStorage>(
     ccx: &mut CheatcodeTracerContext,
     call_ctx: CallContext,
 ) -> InnerZkVmResult {
-    let l1_gas_price = call_ctx.block_basefee.to::<u64>().max(MIN_L1_GAS_PRICE);
-    let fair_l2_gas_price = call_ctx.block_basefee.saturating_to::<u64>();
-    let batch_env = create_l1_batch_env(storage.clone(), l1_gas_price, fair_l2_gas_price);
+    let batch_env = create_l1_batch_env(storage.clone(), &ccx.zk_env);
 
-    let system_contracts = SystemContracts::from_options(&Options::BuiltInWithoutSecurity);
-    let system_env = create_system_env(system_contracts.baseline_contracts, chain_id);
+    let system_contracts = SystemContracts::from_options(&Options::BuiltInWithoutSecurity, false);
+    let baseline_contracts =
+        system_contracts.contracts(zksync_vm_interface::TxExecutionMode::VerifyExecute, false);
+    let system_env = create_system_env(baseline_contracts.clone(), chain_id);
 
     let mut vm: Vm<_, HistoryDisabled> = Vm::new(batch_env.clone(), system_env, storage.clone());
 
     let tx: Transaction = l2_tx.clone().into();
+    let initiator = tx.initiator_account();
 
-    vm.push_transaction(tx.clone());
-    let call_tracer_result = Arc::new(OnceCell::default());
-    let cheatcode_tracer_result = Arc::new(OnceCell::default());
+    let call_tracer_result = Arc::default();
+    let cheatcode_tracer_result = Arc::default();
     let mut expected_calls = HashMap::<_, _>::new();
     if let Some(ec) = &ccx.expected_calls {
         for (addr, v) in ec.iter() {
@@ -438,21 +504,23 @@ fn inspect_inner<S: ReadStorage>(
     }
     let is_static = call_ctx.is_static;
     let is_create = call_ctx.is_create;
-    let bootloader_debug_tracer_result = Arc::new(OnceCell::default());
+    let bootloader_debug_tracer_result = Arc::default();
     let tracers = vec![
         ErrorTracer.into_tracer_pointer(),
-        CallTracer::new(call_tracer_result.clone()).into_tracer_pointer(),
-        BootloaderDebugTracer { result: bootloader_debug_tracer_result.clone() }
+        CallTracer::new(Arc::clone(&call_tracer_result)).into_tracer_pointer(),
+        BootloaderDebugTracer { result: Arc::clone(&bootloader_debug_tracer_result) }
             .into_tracer_pointer(),
         CheatcodeTracer::new(
             ccx.mocked_calls.clone(),
             expected_calls,
-            cheatcode_tracer_result.clone(),
+            Arc::clone(&cheatcode_tracer_result),
             call_ctx,
         )
         .into_tracer_pointer(),
     ];
-    let mut tx_result = vm.inspect(tracers.into(), VmExecutionMode::OneTx);
+    let compressed_bytecodes = vm.push_transaction(tx).compressed_bytecodes.into_owned();
+    let mut tx_result = vm.inspect(&mut tracers.into(), InspectExecutionMode::OneTx);
+
     let mut call_traces = Arc::try_unwrap(call_tracer_result).unwrap().take().unwrap_or_default();
     trace!(?tx_result.result, "zk vm result");
 
@@ -474,6 +542,7 @@ fn inspect_inner<S: ReadStorage>(
     if let Some(expected_calls) = ccx.expected_calls.as_mut() {
         expected_calls.extend(cheatcode_result.expected_calls);
     }
+    let recorded_immutables = cheatcode_result.recorded_immutables;
 
     // populate gas usage info
     let bootloader_debug = Arc::try_unwrap(bootloader_debug_tracer_result)
@@ -503,7 +572,9 @@ fn inspect_inner<S: ReadStorage>(
         bootloader_debug,
     };
 
-    formatter::print_vm_details(&tx_result);
+    let mut formatter = Formatter::new();
+
+    formatter.print_vm_details(&tx_result);
 
     info!("=== Console Logs: ");
     let log_parser = ConsoleLogParser::new();
@@ -520,13 +591,23 @@ fn inspect_inner<S: ReadStorage>(
     let resolve_hashes = get_env_var::<bool>("ZK_DEBUG_RESOLVE_HASHES");
     let show_outputs = get_env_var::<bool>("ZK_DEBUG_SHOW_OUTPUTS");
     info!("=== Calls: ");
-    for call in call_traces.iter() {
-        formatter::print_call(call, 0, &ShowCalls::All, show_outputs, resolve_hashes);
+    for (i, call) in call_traces.iter().enumerate() {
+        let is_last = i == call_traces.len() - 1;
+        formatter.print_call(
+            initiator,
+            None,
+            call,
+            is_last,
+            &ShowCalls::All,
+            show_outputs,
+            resolve_hashes,
+        );
     }
 
     let mut deployed_bytecode_hashes = HashMap::<H160, H256>::default();
     info!("==== {}", format!("{} events", tx_result.logs.events.len()));
-    for event in &tx_result.logs.events {
+    for (i, event) in tx_result.logs.events.iter().enumerate() {
+        let is_last = i == tx_result.logs.events.len() - 1;
         if event.address == CONTRACT_DEPLOYER_ADDRESS {
             deployed_bytecode_hashes.insert(
                 event.indexed_topics.get(3).cloned().unwrap_or_default().to_h160(),
@@ -534,22 +615,17 @@ fn inspect_inner<S: ReadStorage>(
             );
         }
 
-        formatter::print_event(event, resolve_hashes);
+        formatter.print_event(event, resolve_hashes, is_last);
     }
 
-    let bytecodes = vm
-        .get_last_tx_compressed_bytecodes()
+    let bytecodes = compressed_bytecodes
         .iter()
         .map(|b| {
             bytecode_to_factory_dep(b.original.clone())
                 .expect("failed converting bytecode to factory dep")
         })
         .collect::<HashMap<U256, Vec<U256>>>();
-    let modified_storage = if is_static {
-        Default::default()
-    } else {
-        storage.borrow().modified_storage_keys().clone()
-    };
+    let modified_storage = storage.borrow().modified_storage_keys().clone();
 
     // patch CREATE traces.
     for call in call_traces.iter_mut() {
@@ -568,7 +644,7 @@ fn inspect_inner<S: ReadStorage>(
                     .unwrap_or_default();
 
                 if result.len() == 32 {
-                    let address = h256_to_account_address(&H256::from_slice(&result));
+                    let address = h256_to_address(&H256::from_slice(&result));
                     deployed_bytecode_hashes.get(&address).cloned().and_then(|hash| {
                         bytecodes
                             .get(&h256_to_u256(hash))
@@ -586,24 +662,37 @@ fn inspect_inner<S: ReadStorage>(
         None
     };
 
-    InnerZkVmResult {
-        tx_result,
-        bytecodes,
-        modified_storage,
-        call_traces,
-        create_outcome,
-        gas_usage,
+    if is_static {
+        InnerZkVmResult {
+            tx_result,
+            bytecodes: Default::default(),
+            modified_storage: Default::default(),
+            call_traces,
+            create_outcome,
+            gas_usage,
+            recorded_immutables: Default::default(),
+        }
+    } else {
+        InnerZkVmResult {
+            tx_result,
+            bytecodes,
+            modified_storage,
+            call_traces,
+            create_outcome,
+            gas_usage,
+            recorded_immutables,
+        }
     }
 }
 
 /// Patch CREATE traces with bytecode as the data is empty bytes.
 fn call_traces_patch_create<S: ReadStorage>(
     deployed_bytecode_hashes: &HashMap<H160, H256>,
-    bytecodes: &rHashMap<U256, Vec<U256>>,
+    bytecodes: &HashMap<U256, Vec<U256>>,
     storage: StoragePtr<StorageView<S>>,
     call: &mut Call,
 ) {
-    if matches!(call.r#type, zksync_types::vm_trace::CallType::Create) {
+    if matches!(call.r#type, CallType::Create) {
         if let Some(hash) = deployed_bytecode_hashes.get(&call.to).cloned() {
             let maybe_bytecode = bytecodes
                 .get(&h256_to_u256(hash))
@@ -654,13 +743,9 @@ impl ConsoleLogParser {
             return;
         }
 
-        let mut input = current_call.input.clone();
+        let input = current_call.input.clone();
 
-        // Patch the Hardhat-style selector (`uint` instead of `uint256`)
-        patch_hh_console_selector(&mut input);
-
-        // Decode the call
-        let Ok(call) = HardhatConsole::HardhatConsoleCalls::abi_decode(&input, false) else {
+        let Ok(call) = console::hh::ConsoleCalls::abi_decode(&input, false) else {
             return;
         };
 
@@ -695,23 +780,20 @@ where
         .unwrap_or_default()
 }
 
-lazy_static::lazy_static! {
-    /// Maximum size allowed for factory_deps during create.
-    /// We batch factory_deps till this upper limit if there are multiple deps.
-    /// These batches are then deployed individually.
-    ///
-    /// TODO: This feature is disabled by default via `usize::MAX` due to inconsistencies
-    /// with determining a value that works in all cases.
-    static ref MAX_FACTORY_DEPENDENCIES_SIZE_BYTES: usize = std::env::var("MAX_FACTORY_DEPENDENCIES_SIZE_BYTES")
-                                                            .ok()
-                                                            .and_then(|value| value.parse::<usize>().ok())
-                                                            .unwrap_or(usize::MAX);
-}
+/// Maximum size allowed for factory_deps during create.
+/// We batch factory_deps till this upper limit if there are multiple deps.
+/// These batches are then deployed individually.
+static MAX_FACTORY_DEPENDENCIES_SIZE_BYTES: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("MAX_FACTORY_DEPENDENCIES_SIZE_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(100_000)
+});
 
 /// Batch factory deps on the basis of size.
 ///
 /// For large factory_deps the VM can run out of gas. To avoid this case we batch factory_deps
-/// on the basis of [MAX_FACTORY_DEPENDENCIES_SIZE_BYTES] and deploy all but the last batch
+/// on the basis of the max factory dependencies size and deploy all but the last batch
 /// via empty transactions, with the last one deployed normally via create.
 pub fn batch_factory_dependencies(mut factory_deps: Vec<Vec<u8>>) -> Vec<Vec<Vec<u8>>> {
     let factory_deps_count = factory_deps.len();
@@ -755,7 +837,7 @@ pub fn batch_factory_dependencies(mut factory_deps: Vec<Vec<u8>>) -> Vec<Vec<Vec
 /// Transforms a given L2Tx into multiple txs if the factory deps need to be batched
 fn split_tx_by_factory_deps(mut tx: L2Tx) -> Vec<L2Tx> {
     if tx.execute.factory_deps.is_empty() {
-        return vec![tx]
+        return vec![tx];
     }
 
     let mut batched = batch_factory_dependencies(tx.execute.factory_deps);
@@ -764,7 +846,7 @@ fn split_tx_by_factory_deps(mut tx: L2Tx) -> Vec<L2Tx> {
     let mut txs = Vec::with_capacity(batched.len() + 1);
     for deps in batched.into_iter() {
         txs.push(L2Tx::new(
-            H160::zero(),
+            Some(H160::zero()),
             Vec::default(),
             tx.common_data.nonce,
             tx.common_data.fee.clone(),

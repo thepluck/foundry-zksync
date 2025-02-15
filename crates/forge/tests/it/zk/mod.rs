@@ -1,6 +1,7 @@
 //! Forge tests for zkysnc functionality.
 mod basic;
 mod cheats;
+mod constructor;
 mod contracts;
 mod create;
 mod create2;
@@ -9,11 +10,16 @@ mod factory;
 mod factory_deps;
 mod fork;
 mod fuzz;
+mod gas;
 mod invariant;
+mod linking;
 mod logs;
 mod nft;
+mod nonce;
 mod ownership;
 mod paymaster;
 mod proxy;
 mod repros;
+mod script;
+mod sender;
 mod traces;

@@ -1,20 +1,21 @@
 use crate::provider::VerificationContext;
 
-use super::{VerifyArgs, VerifyCheckArgs};
 use alloy_json_abi::JsonAbi;
-use async_trait::async_trait;
-use eyre::{OptionExt, Result};
+use eyre::{eyre, OptionExt, Result};
 use foundry_common::compile::ProjectCompiler;
 use foundry_compilers::{
-    artifacts::{output_selection::OutputSelection, Source},
+    artifacts::{output_selection::OutputSelection, BytecodeObject, Source},
     compilers::CompilerSettings,
     resolver::parse::SolData,
     solc::{Solc, SolcCompiler},
-    zksolc::{ZkSolc, ZkSolcCompiler},
-    zksync::artifact_output::zk::ZkArtifactOutput,
-    Graph, Project,
+    Artifact, Graph, Project,
 };
 use foundry_config::Config;
+use foundry_zksync_compilers::compilers::{
+    artifact_output::zk::ZkArtifactOutput,
+    zksolc::{self, ZkSolc, ZkSolcCompiler},
+};
+use revm_primitives::Bytes;
 use semver::Version;
 use std::path::PathBuf;
 
@@ -43,15 +44,13 @@ impl ZkVerificationContext {
         config: Config,
     ) -> Result<Self> {
         let mut project =
-            foundry_zksync_compiler::config_create_project(&config, config.cache, false)?;
+            foundry_config::zksync::config_create_project(&config, config.cache, false)?;
         project.no_artifacts = true;
-        let zksolc_version = ZkSolc::new(project.compiler.zksolc.clone()).version()?;
-        let mut is_zksync_solc = false;
+        let zksolc_version = project.settings.zksolc_version_ref();
 
-        let solc_version = if let Some(solc) = &config.zksync.solc_path {
-            let solc = Solc::new(solc)?;
-            //TODO: determine if this solc is zksync or not
-            solc.version
+        let (solc_version, is_zksync_solc) = if let Some(solc) = &config.zksync.solc_path {
+            let solc_type_and_version = zksolc::get_solc_version_info(solc)?;
+            (solc_type_and_version.version, solc_type_and_version.zksync_version.is_some())
         } else {
             //if there's no `solc_path` specified then we use the same
             // as the project version
@@ -66,12 +65,11 @@ impl ZkVerificationContext {
             let solc = Solc::new_with_version(solc_path, context_solc_version.clone());
             project.compiler.solc = SolcCompiler::Specific(solc);
 
-            is_zksync_solc = true;
-            context_solc_version
+            (context_solc_version, true)
         };
 
         let compiler_version =
-            ZkVersion { zksolc: zksolc_version, solc: solc_version, is_zksync_solc };
+            ZkVersion { zksolc: zksolc_version.clone(), solc: solc_version, is_zksync_solc };
 
         Ok(Self { config, project, target_name, target_path, compiler_version })
     }
@@ -86,7 +84,7 @@ impl ZkVerificationContext {
         let output = ProjectCompiler::new()
             .quiet(true)
             .files([self.target_path.clone()])
-            .zksync_compile(&project, None)?;
+            .zksync_compile(&project)?;
 
         let artifact = output
             .find(&self.target_path, &self.target_name)
@@ -105,7 +103,7 @@ impl ZkVerificationContext {
         let output = ProjectCompiler::new()
             .quiet(true)
             .files([self.target_path.clone()])
-            .zksync_compile(&project, None)?;
+            .zksync_compile(&project)?;
 
         let artifact = output
             .find(&self.target_path, &self.target_name)
@@ -122,29 +120,6 @@ impl ZkVerificationContext {
 
         Ok(graph.imports(&self.target_path).into_iter().cloned().collect())
     }
-}
-
-/// An abstraction for various verification providers such as etherscan, sourcify, blockscout
-#[async_trait]
-pub trait ZkVerificationProvider {
-    /// This should ensure the verify request can be prepared successfully.
-    ///
-    /// Caution: Implementers must ensure that this _never_ sends the actual verify request
-    /// `[VerificationProvider::verify]`, instead this is supposed to evaluate whether the given
-    /// [`VerifyArgs`] are valid to begin with. This should prevent situations where there's a
-    /// contract deployment that's executed before the verify request and the subsequent verify task
-    /// fails due to misconfiguration.
-    async fn preflight_check(
-        &mut self,
-        args: VerifyArgs,
-        context: ZkVerificationContext,
-    ) -> Result<()>;
-
-    /// Sends the actual verify request for the targeted contract.
-    async fn verify(&mut self, args: VerifyArgs, context: ZkVerificationContext) -> Result<()>;
-
-    /// Checks whether the contract is verified.
-    async fn check(&self, args: VerifyCheckArgs) -> Result<()>;
 }
 
 #[derive(Debug)]
@@ -180,22 +155,25 @@ impl CompilerVerificationContext {
             Self::Solc(c) => &c.compiler_version,
             // TODO: will refer to the solc version here. Analyze if we can remove
             // this ambiguity somehow (e.g: by having sepparate paths for solc/zksolc
-            // and remove this method alltogether)
+            // and remove this method altogether)
             Self::ZkSolc(c) => &c.compiler_version.solc,
         }
     }
+
     pub fn get_target_abi(&self) -> Result<JsonAbi> {
         match self {
             Self::Solc(c) => c.get_target_abi(),
             Self::ZkSolc(c) => c.get_target_abi(),
         }
     }
+
     pub fn get_target_imports(&self) -> Result<Vec<PathBuf>> {
         match self {
             Self::Solc(c) => c.get_target_imports(),
             Self::ZkSolc(c) => c.get_target_imports(),
         }
     }
+
     pub fn get_target_metadata(&self) -> Result<serde_json::Value> {
         match self {
             Self::Solc(c) => {
@@ -203,6 +181,45 @@ impl CompilerVerificationContext {
                 Ok(serde_json::to_value(m)?)
             }
             Self::ZkSolc(c) => c.get_target_metadata(),
+        }
+    }
+
+    pub fn get_target_bytecode(&self) -> Result<Bytes> {
+        match self {
+            Self::Solc(context) => {
+                let output = context.project.compile_file(&context.target_path)?;
+                let artifact = output
+                    .find(&context.target_path, &context.target_name)
+                    .ok_or_eyre("Contract artifact wasn't found locally")?;
+
+                let bytecode = artifact
+                    .get_bytecode_object()
+                    .ok_or_eyre("Contract artifact does not contain bytecode")?;
+
+                match bytecode.as_ref() {
+                    BytecodeObject::Bytecode(bytes) => Ok(bytes.clone()),
+                    BytecodeObject::Unlinked(_) => Err(eyre!(
+                        "You have to provide correct libraries to use --guess-constructor-args"
+                    )),
+                }
+            }
+            Self::ZkSolc(context) => {
+                let output = context.project.compile_file(&context.target_path)?;
+                let artifact = output
+                    .find(&context.target_path, &context.target_name)
+                    .ok_or_eyre("Contract artifact wasn't found locally")?;
+
+                let bytecode = artifact
+                    .get_bytecode_object()
+                    .ok_or_eyre("Contract artifact does not contain bytecode")?;
+
+                match bytecode.as_ref() {
+                    BytecodeObject::Bytecode(bytes) => Ok(bytes.clone()),
+                    BytecodeObject::Unlinked(_) => Err(eyre!(
+                        "You have to provide correct libraries to use --guess-constructor-args"
+                    )),
+                }
+            }
         }
     }
 }

@@ -1,10 +1,8 @@
-#[macro_use]
-extern crate tracing;
-
 use clap::{CommandFactory, Parser};
 use clap_complete::generate;
 use eyre::Result;
 use foundry_cli::{handler, utils};
+use foundry_common::shell;
 use foundry_evm::inspectors::cheatcodes::{set_execution_context, ForgeContext};
 
 mod cmd;
@@ -13,37 +11,51 @@ use cmd::{cache::CacheSubcommands, generate::GenerateSubcommands, watch};
 mod opts;
 use opts::{Forge, ForgeSubcommand};
 
+#[macro_use]
+extern crate foundry_common;
+
+#[macro_use]
+extern crate tracing;
+
 #[cfg(all(feature = "jemalloc", unix))]
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-fn main() -> Result<()> {
+fn main() {
+    if let Err(err) = run() {
+        let _ = foundry_common::sh_err!("{err:?}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
     handler::install();
     utils::load_dotenv();
     utils::subscriber();
     utils::enable_paint();
 
-    let opts = Forge::parse();
-    init_execution_context(&opts.cmd);
+    let args = Forge::parse();
+    args.global.init()?;
+    init_execution_context(&args.cmd);
 
-    match opts.cmd {
+    match args.cmd {
         ForgeSubcommand::Test(cmd) => {
             if cmd.is_watch() {
                 utils::block_on(watch::watch_test(cmd))
             } else {
+                let silent = cmd.junit || shell::is_json();
                 let outcome = utils::block_on(cmd.run())?;
-                outcome.ensure_ok()
+                outcome.ensure_ok(silent)
             }
         }
-        ForgeSubcommand::Script(cmd) => {
-            // install the shell before executing the command
-            foundry_common::shell::set_shell(foundry_common::shell::Shell::from_args(
-                cmd.opts.silent,
-                cmd.json,
-            ))?;
-            utils::block_on(cmd.run_script())
+        ForgeSubcommand::Script(cmd) => utils::block_on(cmd.run_script()),
+        ForgeSubcommand::Coverage(cmd) => {
+            if cmd.is_watch() {
+                utils::block_on(watch::watch_coverage(cmd))
+            } else {
+                utils::block_on(cmd.run())
+            }
         }
-        ForgeSubcommand::Coverage(cmd) => utils::block_on(cmd.run()),
         ForgeSubcommand::Bind(cmd) => cmd.run(),
         ForgeSubcommand::Build(cmd) => {
             if cmd.is_watch() {
@@ -52,9 +64,9 @@ fn main() -> Result<()> {
                 cmd.run().map(drop)
             }
         }
-        ForgeSubcommand::Debug(cmd) => utils::block_on(cmd.run()),
         ForgeSubcommand::VerifyContract(args) => utils::block_on(args.run()),
         ForgeSubcommand::VerifyCheck(args) => utils::block_on(args.run()),
+        ForgeSubcommand::VerifyBytecode(cmd) => utils::block_on(cmd.run()),
         ForgeSubcommand::Clone(cmd) => utils::block_on(cmd.run()),
         ForgeSubcommand::Cache(cmd) => match cmd.sub {
             CacheSubcommands::Clean(cmd) => cmd.run(),
@@ -80,14 +92,17 @@ fn main() -> Result<()> {
             Ok(())
         }
         ForgeSubcommand::Clean { root } => {
-            let config = utils::load_config_with_root(root);
+            let config = utils::load_config_with_root(root.as_deref())?;
             let project = config.project()?;
+            let zk_project =
+                foundry_config::zksync::config_create_project(&config, config.cache, false)?;
             config.cleanup(&project)?;
+            config.cleanup(&zk_project)?;
             Ok(())
         }
         ForgeSubcommand::Snapshot(cmd) => {
             if cmd.is_watch() {
-                utils::block_on(watch::watch_snapshot(cmd))
+                utils::block_on(watch::watch_gas_snapshot(cmd))
             } else {
                 utils::block_on(cmd.run())
             }
@@ -98,20 +113,26 @@ fn main() -> Result<()> {
         ForgeSubcommand::Inspect(cmd) => cmd.run(),
         ForgeSubcommand::Tree(cmd) => cmd.run(),
         ForgeSubcommand::Geiger(cmd) => {
-            let check = cmd.check;
             let n = cmd.run()?;
-            if check && n > 0 {
+            if n > 0 {
                 std::process::exit(n as i32);
             }
             Ok(())
         }
-        ForgeSubcommand::Doc(cmd) => cmd.run(),
+        ForgeSubcommand::Doc(cmd) => {
+            if cmd.is_watch() {
+                utils::block_on(watch::watch_doc(cmd))
+            } else {
+                utils::block_on(cmd.run())?;
+                Ok(())
+            }
+        }
         ForgeSubcommand::Selectors { command } => utils::block_on(command.run()),
         ForgeSubcommand::Generate(cmd) => match cmd.sub {
             GenerateSubcommands::Test(cmd) => cmd.run(),
         },
-        ForgeSubcommand::VerifyBytecode(cmd) => utils::block_on(cmd.run()),
-        ForgeSubcommand::Soldeer(cmd) => cmd.run(),
+        ForgeSubcommand::Compiler(cmd) => cmd.run(),
+        ForgeSubcommand::Soldeer(cmd) => utils::block_on(cmd.run()),
         ForgeSubcommand::Eip712(cmd) => cmd.run(),
         ForgeSubcommand::BindJson(cmd) => cmd.run(),
     }

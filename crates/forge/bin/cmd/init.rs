@@ -1,7 +1,7 @@
 use super::install::DependencyInstallOpts;
 use clap::{Parser, ValueHint};
 use eyre::Result;
-use foundry_cli::{p_println, utils::Git};
+use foundry_cli::utils::Git;
 use foundry_common::fs;
 use foundry_compilers::artifacts::remappings::Remapping;
 use foundry_config::Config;
@@ -38,20 +38,20 @@ pub struct InitArgs {
     pub vscode: bool,
 
     #[command(flatten)]
-    pub opts: DependencyInstallOpts,
+    pub install: DependencyInstallOpts,
 }
 
 impl InitArgs {
     pub fn run(self) -> Result<()> {
-        let Self { root, template, branch, opts, offline, force, vscode } = self;
-        let DependencyInstallOpts { shallow, no_git, no_commit, quiet, zksync } = opts;
+        let Self { root, template, branch, install, offline, force, vscode } = self;
+        let DependencyInstallOpts { shallow, no_git, no_commit, zksync } = install;
 
         // create the root dir if it does not exist
         if !root.exists() {
             fs::create_dir_all(&root)?;
         }
         let root = dunce::canonicalize(root)?;
-        let git = Git::new(&root).quiet(quiet).shallow(shallow);
+        let git = Git::new(&root).shallow(shallow);
 
         // if a template is provided, then this command initializes a git repo,
         // fetches the template repo, and resets the git history to the head of the fetched
@@ -62,7 +62,7 @@ impl InitArgs {
             } else {
                 "https://github.com/".to_string() + &template
             };
-            p_println!(!quiet => "Initializing {} from {}...", root.display(), template);
+            sh_println!("Initializing {} from {}...", root.display(), template)?;
             // initialize the git repository
             git.init()?;
 
@@ -88,15 +88,14 @@ impl InitArgs {
             }
         } else {
             // if target is not empty
-            if root.read_dir().map_or(false, |mut i| i.next().is_some()) {
+            if root.read_dir().is_ok_and(|mut i| i.next().is_some()) {
                 if !force {
                     eyre::bail!(
                         "Cannot run `init` on a non-empty directory.\n\
                         Run with the `--force` flag to initialize regardless."
                     );
                 }
-
-                p_println!(!quiet => "Target directory is not empty, but `--force` was specified");
+                sh_warn!("Target directory is not empty, but `--force` was specified")?;
             }
 
             // ensure git status is clean before generating anything
@@ -104,7 +103,7 @@ impl InitArgs {
                 git.ensure_clean()?;
             }
 
-            p_println!(!quiet => "Initializing {}...", root.display());
+            sh_println!("Initializing {}...", root.display())?;
 
             // make the dirs
             let src = root.join("src");
@@ -131,11 +130,11 @@ impl InitArgs {
 
             // write foundry.toml, if it doesn't exist already
             let dest = root.join(Config::FILE_NAME);
-            let mut config = Config::load_with_root(&root);
+            let mut config = Config::load_with_root(&root)?;
             if !dest.exists() {
                 fs::write(dest, config.clone().into_basic().to_string_pretty()?)?;
             }
-            let git = self.opts.git(&config);
+            let git = self.install.git(&config);
 
             // set up the repo
             if !no_git {
@@ -145,22 +144,36 @@ impl InitArgs {
             // install forge-std
             if !offline {
                 if root.join("lib/forge-std").exists() {
-                    p_println!(!quiet => "\"lib/forge-std\" already exists, skipping install....");
-                    self.opts.install(&mut config, vec![])?;
+                    sh_warn!("\"lib/forge-std\" already exists, skipping install...")?;
+                    self.install.install(&mut config, vec![])?;
                 } else {
                     let dep = "https://github.com/foundry-rs/forge-std".parse()?;
-                    self.opts.install(&mut config, vec![dep])?;
+                    self.install.install(&mut config, vec![dep])?;
                 }
             }
 
-            // install forge-zksync-std
+            // NOTE(zk): install forge-zksync-std
             if zksync && !offline {
                 if root.join("lib/forge-zksync-std").exists() {
-                    p_println!(!quiet => "\"lib/forge-zksync-std\" already exists, skipping install....");
-                    self.opts.install(&mut config, vec![])?;
+                    sh_println!("\"lib/forge-zksync-std\" already exists, skipping install....")?;
+                    self.install.install(&mut config, vec![])?;
                 } else {
                     let dep = "https://github.com/Moonsong-Labs/forge-zksync-std".parse()?;
-                    self.opts.install(&mut config, vec![dep])?;
+                    self.install.install(&mut config, vec![dep])?;
+                }
+
+                //Add zkout/ to .gitignore under compiler files if it doesn't exist
+                let gitignore_path = root.join(".gitignore");
+                if gitignore_path.exists() {
+                    let mut content = fs::read_to_string(&gitignore_path)?;
+                    if !content.contains("zkout/") {
+                        // Find the compiler files section and add zkout/
+                        if let Some(pos) = content.find("out/") {
+                            let insert_pos = pos + "out/".len();
+                            content.insert_str(insert_pos, "\nzkout/");
+                            fs::write(&gitignore_path, content)?;
+                        }
+                    }
                 }
             }
 
@@ -170,7 +183,7 @@ impl InitArgs {
             }
         }
 
-        p_println!(!quiet => "    {} forge project",  "Initialized".green());
+        sh_println!("{}", "    Initialized forge project".green())?;
         Ok(())
     }
 }

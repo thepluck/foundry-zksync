@@ -3,10 +3,10 @@ use foundry_compilers::artifacts::{output_selection::ContractOutputSelection, Ev
 use serde::Serialize;
 
 mod core;
-pub use self::core::CoreBuildArgs;
+pub use self::core::BuildOpts;
 
 mod paths;
-pub use self::paths::ProjectPathsArgs;
+pub use self::paths::ProjectPathOpts;
 
 mod zksync;
 pub use self::zksync::ZkSyncArgs;
@@ -17,7 +17,7 @@ pub use self::zksync::ZkSyncArgs;
 // See also `BuildArgs`.
 #[derive(Clone, Debug, Default, Serialize, Parser)]
 #[command(next_help_heading = "Compiler options")]
-pub struct CompilerArgs {
+pub struct CompilerOpts {
     /// Includes the AST as JSON in the compiler output.
     #[arg(long, help_heading = "Compiler options")]
     #[serde(skip)]
@@ -29,11 +29,15 @@ pub struct CompilerArgs {
     pub evm_version: Option<EvmVersion>,
 
     /// Activate the Solidity optimizer.
-    #[arg(long)]
+    #[arg(long, default_missing_value="true", num_args = 0..=1)]
     #[serde(skip)]
-    pub optimize: bool,
+    pub optimize: Option<bool>,
 
-    /// The number of optimizer runs.
+    /// The number of runs specifies roughly how often each opcode of the deployed code will be
+    /// executed across the life-time of the contract. This means it is a trade-off parameter
+    /// between code size (deploy cost) and code execution cost (cost after deployment).
+    /// An `optimizer_runs` parameter of `1` will produce short but expensive code. In contrast, a
+    /// larger `optimizer_runs` parameter will produce longer but more gas efficient code.
     #[arg(long, value_name = "RUNS")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub optimizer_runs: Option<usize>,
@@ -65,15 +69,15 @@ mod tests {
 
     #[test]
     fn can_parse_evm_version() {
-        let args: CompilerArgs =
-            CompilerArgs::parse_from(["foundry-cli", "--evm-version", "london"]);
+        let args: CompilerOpts =
+            CompilerOpts::parse_from(["foundry-cli", "--evm-version", "london"]);
         assert_eq!(args.evm_version, Some(EvmVersion::London));
     }
 
     #[test]
     fn can_parse_extra_output() {
-        let args: CompilerArgs =
-            CompilerArgs::parse_from(["foundry-cli", "--extra-output", "metadata", "ir-optimized"]);
+        let args: CompilerOpts =
+            CompilerOpts::parse_from(["foundry-cli", "--extra-output", "metadata", "ir-optimized"]);
         assert_eq!(
             args.extra_output,
             vec![ContractOutputSelection::Metadata, ContractOutputSelection::IrOptimized]
@@ -82,7 +86,7 @@ mod tests {
 
     #[test]
     fn can_parse_extra_output_files() {
-        let args: CompilerArgs = CompilerArgs::parse_from([
+        let args: CompilerOpts = CompilerOpts::parse_from([
             "foundry-cli",
             "--extra-output-files",
             "metadata",

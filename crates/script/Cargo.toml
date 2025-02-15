@@ -23,8 +23,10 @@ foundry-debugger.workspace = true
 foundry-cheatcodes.workspace = true
 foundry-wallets.workspace = true
 foundry-linking.workspace = true
+forge-script-sequence.workspace = true
+foundry-strategy-zksync.workspace = true
 foundry-zksync-core.workspace = true
-foundry-zksync-compiler.workspace = true
+foundry-zksync-compilers.workspace = true
 
 serde.workspace = true
 eyre.workspace = true
@@ -35,7 +37,7 @@ tracing.workspace = true
 clap = { version = "4", features = ["derive", "env", "unicode", "wrap_help"] }
 semver.workspace = true
 futures.workspace = true
-async-recursion = "1.0.5"
+tokio.workspace = true
 
 itertools.workspace = true
 parking_lot.workspace = true
@@ -55,9 +57,8 @@ alloy-dyn-abi.workspace = true
 alloy-primitives.workspace = true
 alloy-eips.workspace = true
 alloy-transport.workspace = true
-
-# zksync
-zksync-web3-rs.workspace = true
+alloy-consensus.workspace = true
+alloy-zksync.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

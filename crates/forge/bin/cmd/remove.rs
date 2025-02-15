@@ -29,7 +29,7 @@ impl_figment_convert_basic!(RemoveArgs);
 
 impl RemoveArgs {
     pub fn run(self) -> Result<()> {
-        let config = self.try_load_config_emit_warnings()?;
+        let config = self.load_config()?;
         let (root, paths) = super::update::dependencies_paths(&self.dependencies, &config)?;
         let git_modules = root.join(".git/modules");
 
@@ -38,7 +38,7 @@ impl RemoveArgs {
 
         // remove all the dependencies from .git/modules
         for (Dependency { name, url, tag, .. }, path) in self.dependencies.iter().zip(&paths) {
-            println!("Removing '{name}' in {}, (url: {url:?}, tag: {tag:?})", path.display());
+            sh_println!("Removing '{name}' in {}, (url: {url:?}, tag: {tag:?})", path.display())?;
             std::fs::remove_dir_all(git_modules.join(path))?;
         }
 

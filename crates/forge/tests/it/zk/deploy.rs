@@ -11,8 +11,9 @@ forgetest_async!(multiple_deployments_of_the_same_contract, |prj, cmd| {
         "DeployScript",
         None,
         3,
-        Some(&["-vvvvv"]),
-    );
+        Some(&["-vvvvv", "--broadcast"]),
+    )
+    .await;
     run_zk_script_test(
         prj.root(),
         &mut cmd,
@@ -20,8 +21,9 @@ forgetest_async!(multiple_deployments_of_the_same_contract, |prj, cmd| {
         "DeployScript",
         None,
         3,
-        Some(&["-vvvvv"]),
-    );
+        Some(&["-vvvvv", "--broadcast"]),
+    )
+    .await;
 });
 
 fn setup_deploy_prj(prj: &mut TestProject) {

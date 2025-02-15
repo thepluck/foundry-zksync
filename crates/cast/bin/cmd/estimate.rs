@@ -1,16 +1,18 @@
-use crate::tx::CastTxBuilder;
-use alloy_primitives::{TxKind, U256};
+use crate::tx::{CastTxBuilder, SenderKind};
+use alloy_primitives::U256;
 use alloy_provider::Provider;
 use alloy_rpc_types::BlockId;
+use cast::zksync::ZkTransactionOpts;
 use clap::Parser;
 use eyre::Result;
 use foundry_cli::{
     opts::{EthereumOpts, TransactionOpts},
-    utils::{self, parse_ether_value},
+    utils::{self, parse_ether_value, LoadConfig},
 };
 use foundry_common::ens::NameOrAddress;
-use foundry_config::Config;
 use std::str::FromStr;
+
+mod zksync;
 
 /// CLI arguments for `cast estimate`.
 #[derive(Debug, Parser)]
@@ -39,6 +41,14 @@ pub struct EstimateArgs {
 
     #[command(flatten)]
     eth: EthereumOpts,
+
+    /// Zksync Transaction
+    #[command(flatten)]
+    zk_tx: ZkTransactionOpts,
+
+    /// Force a zksync eip-712 transaction and apply CREATE overrides
+    #[arg(long = "zksync")]
+    zk_force: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -67,17 +77,11 @@ pub enum EstimateSubcommands {
 
 impl EstimateArgs {
     pub async fn run(self) -> Result<()> {
-        let Self { to, mut sig, mut args, mut tx, block, eth, command } = self;
+        let Self { to, mut sig, mut args, mut tx, block, eth, command, zk_tx, zk_force } = self;
 
-        let config = Config::from(&eth);
+        let config = eth.load_config()?;
         let provider = utils::get_provider(&config)?;
-        let sender = eth.wallet.sender().await;
-
-        let tx_kind = if let Some(to) = to {
-            TxKind::Call(to.resolve(&provider).await?)
-        } else {
-            TxKind::Create
-        };
+        let sender = SenderKind::from_wallet_opts(eth.wallet).await?;
 
         let code = if let Some(EstimateSubcommands::Create {
             code,
@@ -98,14 +102,23 @@ impl EstimateArgs {
 
         let (tx, _) = CastTxBuilder::new(&provider, tx, &config)
             .await?
-            .with_tx_kind(tx_kind)
-            .with_code_sig_and_args(code, sig, args)
+            .with_to(to)
+            .await?
+            // NOTE(zk): `with_code_sig_and_args` decodes the code and appends it to the input
+            // we want the raw decoded constructor input from that function so we keep the code
+            // to encode the CONTRACT_CREATOR call later
+            .with_code_sig_and_args(code.clone(), sig, args)
             .await?
             .build_raw(sender)
             .await?;
 
-        let gas = provider.estimate_gas(&tx).block(block.unwrap_or_default()).await?;
-        println!("{gas}");
+        let gas = if zk_tx.has_zksync_args() || zk_force {
+            zksync::estimate_gas(zk_tx, tx, code, &config).await?
+        } else {
+            provider.estimate_gas(&tx).block(block.unwrap_or_default()).await?
+        };
+
+        sh_println!("{gas}")?;
         Ok(())
     }
 }

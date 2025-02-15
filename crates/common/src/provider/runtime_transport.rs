@@ -1,7 +1,7 @@
 //! Runtime transport that connects on first request, which can take either of an HTTP,
 //! WebSocket, or IPC transport and supports retries based on CUPS logic.
 
-use crate::REQUEST_TIMEOUT;
+use crate::{DEFAULT_USER_AGENT, REQUEST_TIMEOUT};
 use alloy_json_rpc::{RequestPacket, ResponsePacket};
 use alloy_pubsub::{PubSubConnect, PubSubFrontend};
 use alloy_rpc_types::engine::{Claims, JwtSecret};
@@ -62,6 +62,8 @@ pub enum RuntimeTransportError {
     InvalidJwt(String),
 }
 
+/// Runtime transport that only connects on first request.
+///
 /// A runtime transport is a custom [alloy_transport::Transport] that only connects when the *first*
 /// request is made. When the first request is made, it will connect to the runtime using either an
 /// HTTP WebSocket, or IPC transport depending on the URL used.
@@ -174,6 +176,14 @@ impl RuntimeTransport {
             );
         }
 
+        if !headers.contains_key(reqwest::header::USER_AGENT) {
+            headers.insert(
+                reqwest::header::USER_AGENT,
+                HeaderValue::from_str(DEFAULT_USER_AGENT)
+                    .expect("User-Agent should be valid string"),
+            );
+        }
+
         client_builder = client_builder.default_headers(headers);
 
         let client =
@@ -185,7 +195,7 @@ impl RuntimeTransport {
     /// Connects to a WS transport.
     async fn connect_ws(&self) -> Result<InnerTransport, RuntimeTransportError> {
         let auth = self.jwt.as_ref().and_then(|jwt| build_auth(jwt.clone()).ok());
-        let ws = WsConnect { url: self.url.to_string(), auth }
+        let ws = WsConnect { url: self.url.to_string(), auth, config: None }
             .into_service()
             .await
             .map_err(|e| RuntimeTransportError::TransportError(e, self.url.to_string()))?;
@@ -321,4 +331,43 @@ fn url_to_file_path(url: &Url) -> Result<PathBuf, ()> {
 #[cfg(not(windows))]
 fn url_to_file_path(url: &Url) -> Result<PathBuf, ()> {
     url.to_file_path()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::header::HeaderMap;
+
+    #[tokio::test]
+    async fn test_user_agent_header() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+
+        let http_handler = axum::routing::get(|actual_headers: HeaderMap| {
+            let user_agent = HeaderName::from_str("User-Agent").unwrap();
+            assert_eq!(actual_headers[user_agent], HeaderValue::from_str("test-agent").unwrap());
+
+            async { "" }
+        });
+
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, http_handler.into_make_service()).await.unwrap()
+        });
+
+        let transport = RuntimeTransportBuilder::new(url.clone())
+            .with_headers(vec!["User-Agent: test-agent".to_string()])
+            .build();
+        let inner = transport.connect_http().await.unwrap();
+
+        match inner {
+            InnerTransport::Http(http) => {
+                let _ = http.client().get(url).send().await.unwrap();
+
+                // assert inside http_handler
+            }
+            _ => unreachable!(),
+        }
+
+        server_task.abort();
+    }
 }

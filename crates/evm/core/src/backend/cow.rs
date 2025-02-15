@@ -1,16 +1,16 @@
 //! A wrapper around `Backend` that is clone-on-write used for fuzzing.
 
-use super::{BackendError, ForkInfo};
+use super::{strategy::BackendStrategy, BackendError, ForkInfo};
 use crate::{
     backend::{
-        diagnostic::RevertDiagnostic, Backend, DatabaseExt, LocalForkId, RevertSnapshotAction,
+        diagnostic::RevertDiagnostic, Backend, DatabaseExt, LocalForkId, RevertStateSnapshotAction,
     },
     fork::{CreateFork, ForkId},
     InspectorExt,
 };
 use alloy_genesis::GenesisAccount;
 use alloy_primitives::{Address, B256, U256};
-use eyre::WrapErr;
+use alloy_rpc_types::TransactionRequest;
 use foundry_fork_db::DatabaseError;
 use revm::{
     db::DatabaseRef,
@@ -20,10 +20,7 @@ use revm::{
     },
     Database, DatabaseCommit, JournaledState,
 };
-use std::{
-    borrow::Cow,
-    collections::{BTreeMap, HashMap},
-};
+use std::{any::Any, borrow::Cow, collections::BTreeMap};
 
 /// A wrapper around `Backend` that ensures only `revm::DatabaseRef` functions are called.
 ///
@@ -48,62 +45,41 @@ pub struct CowBackend<'a> {
     /// No calls on the `CowBackend` will ever persistently modify the `backend`'s state.
     pub backend: Cow<'a, Backend>,
     /// Keeps track of whether the backed is already initialized
-    is_initialized: bool,
+    pub is_initialized: bool,
     /// The [SpecId] of the current backend.
-    spec_id: SpecId,
+    pub spec_id: SpecId,
 }
 
 impl<'a> CowBackend<'a> {
     /// Creates a new `CowBackend` with the given `Backend`.
-    pub fn new(backend: &'a Backend) -> Self {
+    pub fn new_borrowed(backend: &'a Backend) -> Self {
         Self { backend: Cow::Borrowed(backend), is_initialized: false, spec_id: SpecId::LATEST }
-    }
-
-    /// Executes the configured zk transaction of the `env` without committing state changes
-    pub fn inspect_ref_zk(
-        &mut self,
-        env: &mut Env,
-        persisted_factory_deps: &mut HashMap<foundry_zksync_core::H256, Vec<u8>>,
-        factory_deps: Option<Vec<Vec<u8>>>,
-    ) -> eyre::Result<ResultAndState> {
-        // this is a new call to inspect with a new env, so even if we've cloned the backend
-        // already, we reset the initialized state
-        self.is_initialized = false;
-
-        foundry_zksync_core::vm::transact(Some(persisted_factory_deps), factory_deps, env, self)
     }
 
     /// Executes the configured transaction of the `env` without committing state changes
     ///
     /// Note: in case there are any cheatcodes executed that modify the environment, this will
     /// update the given `env` with the new values.
-    pub fn inspect<'b, I: InspectorExt<&'b mut Self>>(
-        &'b mut self,
+    #[instrument(name = "inspect", level = "debug", skip_all)]
+    pub fn inspect<I: InspectorExt>(
+        &mut self,
         env: &mut EnvWithHandlerCfg,
-        inspector: I,
+        inspector: &mut I,
+        inspect_ctx: Box<dyn Any>,
     ) -> eyre::Result<ResultAndState> {
         // this is a new call to inspect with a new env, so even if we've cloned the backend
         // already, we reset the initialized state
         self.is_initialized = false;
         self.spec_id = env.handler_cfg.spec_id;
-        let mut evm = crate::utils::new_evm_with_inspector(self, env.clone(), inspector);
 
-        let res = evm.transact().wrap_err("backend: failed while inspecting")?;
-
-        env.env = evm.context.evm.inner.env;
-
-        Ok(res)
+        self.backend.strategy.runner.inspect(self.backend.to_mut(), env, inspector, inspect_ctx)
     }
 
-    pub fn new_borrowed(backend: &'a Backend) -> Self {
-        Self { backend: Cow::Borrowed(backend), is_initialized: false, spec_id: SpecId::LATEST }
-    }
-
-    /// Returns whether there was a snapshot failure in the backend.
+    /// Returns whether there was a state snapshot failure in the backend.
     ///
     /// This is bubbled up from the underlying Copy-On-Write backend when a revert occurs.
-    pub fn has_snapshot_failure(&self) -> bool {
-        self.backend.has_snapshot_failure()
+    pub fn has_state_snapshot_failure(&self) -> bool {
+        self.backend.has_state_snapshot_failure()
     }
 
     /// Returns a mutable instance of the Backend.
@@ -129,36 +105,40 @@ impl<'a> CowBackend<'a> {
     }
 }
 
-impl<'a> DatabaseExt for CowBackend<'a> {
+impl DatabaseExt for CowBackend<'_> {
     fn get_fork_info(&mut self, id: LocalForkId) -> eyre::Result<ForkInfo> {
         self.backend.to_mut().get_fork_info(id)
     }
 
-    fn snapshot(&mut self, journaled_state: &JournaledState, env: &Env) -> U256 {
-        self.backend_mut(env).snapshot(journaled_state, env)
+    fn get_strategy(&mut self) -> &mut BackendStrategy {
+        &mut self.backend.to_mut().strategy
     }
 
-    fn revert(
+    fn snapshot_state(&mut self, journaled_state: &JournaledState, env: &Env) -> U256 {
+        self.backend_mut(env).snapshot_state(journaled_state, env)
+    }
+
+    fn revert_state(
         &mut self,
         id: U256,
         journaled_state: &JournaledState,
         current: &mut Env,
-        action: RevertSnapshotAction,
+        action: RevertStateSnapshotAction,
     ) -> Option<JournaledState> {
-        self.backend_mut(current).revert(id, journaled_state, current, action)
+        self.backend_mut(current).revert_state(id, journaled_state, current, action)
     }
 
-    fn delete_snapshot(&mut self, id: U256) -> bool {
-        // delete snapshot requires a previous snapshot to be initialized
+    fn delete_state_snapshot(&mut self, id: U256) -> bool {
+        // delete state snapshot requires a previous snapshot to be initialized
         if let Some(backend) = self.initialized_backend_mut() {
-            return backend.delete_snapshot(id)
+            return backend.delete_state_snapshot(id)
         }
         false
     }
 
-    fn delete_snapshots(&mut self) {
+    fn delete_state_snapshots(&mut self) {
         if let Some(backend) = self.initialized_backend_mut() {
-            backend.delete_snapshots()
+            backend.delete_state_snapshots()
         }
     }
 
@@ -207,11 +187,21 @@ impl<'a> DatabaseExt for CowBackend<'a> {
         &mut self,
         id: Option<LocalForkId>,
         transaction: B256,
-        env: &mut Env,
+        env: Env,
         journaled_state: &mut JournaledState,
-        inspector: &mut dyn InspectorExt<Backend>,
+        inspector: &mut dyn InspectorExt,
     ) -> eyre::Result<()> {
-        self.backend_mut(env).transact(id, transaction, env, journaled_state, inspector)
+        self.backend_mut(&env).transact(id, transaction, env, journaled_state, inspector)
+    }
+
+    fn transact_from_tx(
+        &mut self,
+        transaction: &TransactionRequest,
+        env: Env,
+        journaled_state: &mut JournaledState,
+        inspector: &mut dyn InspectorExt,
+    ) -> eyre::Result<()> {
+        self.backend_mut(&env).transact_from_tx(transaction, env, journaled_state, inspector)
     }
 
     fn active_fork_id(&self) -> Option<LocalForkId> {
@@ -244,6 +234,15 @@ impl<'a> DatabaseExt for CowBackend<'a> {
         journaled_state: &mut JournaledState,
     ) -> Result<(), BackendError> {
         self.backend_mut(&Env::default()).load_allocs(allocs, journaled_state)
+    }
+
+    fn clone_account(
+        &mut self,
+        source: &GenesisAccount,
+        target: &Address,
+        journaled_state: &mut JournaledState,
+    ) -> Result<(), BackendError> {
+        self.backend_mut(&Env::default()).clone_account(source, target, journaled_state)
     }
 
     fn is_persistent(&self, acc: &Address) -> bool {
@@ -283,7 +282,7 @@ impl<'a> DatabaseExt for CowBackend<'a> {
     }
 }
 
-impl<'a> DatabaseRef for CowBackend<'a> {
+impl DatabaseRef for CowBackend<'_> {
     type Error = DatabaseError;
 
     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
@@ -303,7 +302,7 @@ impl<'a> DatabaseRef for CowBackend<'a> {
     }
 }
 
-impl<'a> Database for CowBackend<'a> {
+impl Database for CowBackend<'_> {
     type Error = DatabaseError;
 
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
@@ -323,7 +322,7 @@ impl<'a> Database for CowBackend<'a> {
     }
 }
 
-impl<'a> DatabaseCommit for CowBackend<'a> {
+impl DatabaseCommit for CowBackend<'_> {
     fn commit(&mut self, changes: Map<Address, Account>) {
         self.backend.to_mut().commit(changes)
     }

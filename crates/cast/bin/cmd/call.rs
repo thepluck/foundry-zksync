@@ -1,4 +1,4 @@
-use crate::tx::CastTxBuilder;
+use crate::tx::{CastTxBuilder, SenderKind};
 use alloy_primitives::{TxKind, U256};
 use alloy_rpc_types::{BlockId, BlockNumberOrTag};
 use cast::{traces::TraceKind, Cast};
@@ -8,10 +8,21 @@ use foundry_cli::{
     opts::{EthereumOpts, TransactionOpts},
     utils::{self, handle_traces, parse_ether_value, TraceResult},
 };
-use foundry_common::ens::NameOrAddress;
+use foundry_common::{ens::NameOrAddress, shell};
 use foundry_compilers::artifacts::EvmVersion;
-use foundry_config::{find_project_root_path, Config};
-use foundry_evm::{executors::TracingExecutor, opts::EvmOpts};
+use foundry_config::{
+    figment::{
+        self,
+        value::{Dict, Map},
+        Figment, Metadata, Profile,
+    },
+    Config,
+};
+use foundry_evm::{
+    executors::TracingExecutor,
+    opts::EvmOpts,
+    traces::{InternalTraceMode, TraceMode},
+};
 use std::str::FromStr;
 
 /// CLI arguments for `cast call`.
@@ -62,6 +73,10 @@ pub struct CallArgs {
     #[arg(long, short)]
     block: Option<BlockId>,
 
+    /// Enable Odyssey features.
+    #[arg(long, alias = "alphanet")]
+    pub odyssey: bool,
+
     #[command(subcommand)]
     command: Option<CallSubcommands>,
 
@@ -70,6 +85,10 @@ pub struct CallArgs {
 
     #[command(flatten)]
     eth: EthereumOpts,
+
+    /// Use current project artifacts for trace decoding.
+    #[arg(long, visible_alias = "la")]
+    pub with_local_artifacts: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -98,6 +117,11 @@ pub enum CallSubcommands {
 
 impl CallArgs {
     pub async fn run(self) -> Result<()> {
+        let figment = Into::<Figment>::into(&self.eth).merge(&self);
+        let evm_opts = figment.extract::<EvmOpts>()?;
+        let mut config = Config::from_provider(figment)?.sanitized();
+        let strategy = utils::get_executor_strategy(&config);
+
         let Self {
             to,
             mut sig,
@@ -112,21 +136,17 @@ impl CallArgs {
             decode_internal,
             labels,
             data,
+            with_local_artifacts,
+            ..
         } = self;
 
         if let Some(data) = data {
             sig = Some(data);
         }
 
-        let mut config = Config::from(&eth);
         let provider = utils::get_provider(&config)?;
-        let sender = eth.wallet.sender().await;
-
-        let tx_kind = if let Some(to) = to {
-            TxKind::Call(to.resolve(&provider).await?)
-        } else {
-            TxKind::Create
-        };
+        let sender = SenderKind::from_wallet_opts(eth.wallet).await?;
+        let from = sender.address();
 
         let code = if let Some(CallSubcommands::Create {
             code,
@@ -147,52 +167,97 @@ impl CallArgs {
 
         let (tx, func) = CastTxBuilder::new(&provider, tx, &config)
             .await?
-            .with_tx_kind(tx_kind)
+            .with_to(to)
+            .await?
             .with_code_sig_and_args(code, sig, args)
             .await?
             .build_raw(sender)
             .await?;
 
         if trace {
-            let figment =
-                Config::figment_with_root(find_project_root_path(None).unwrap()).merge(eth.rpc);
-            let evm_opts = figment.extract::<EvmOpts>()?;
             if let Some(BlockId::Number(BlockNumberOrTag::Number(block_number))) = self.block {
                 // Override Config `fork_block_number` (if set) with CLI value.
                 config.fork_block_number = Some(block_number);
             }
 
-            let (mut env, fork, chain) =
+            let create2_deployer = evm_opts.create2_deployer;
+            let (mut env, fork, chain, odyssey) =
                 TracingExecutor::get_fork_material(&config, evm_opts).await?;
 
             // modify settings that usually set in eth_call
             env.cfg.disable_block_gas_limit = true;
             env.block.gas_limit = U256::MAX;
 
-            let mut executor = TracingExecutor::new(env, fork, evm_version, debug, decode_internal);
+            let trace_mode = TraceMode::Call
+                .with_debug(debug)
+                .with_decode_internal(if decode_internal {
+                    InternalTraceMode::Full
+                } else {
+                    InternalTraceMode::None
+                })
+                .with_state_changes(shell::verbosity() > 4);
+            let mut executor = TracingExecutor::new(
+                env,
+                fork,
+                evm_version,
+                trace_mode,
+                odyssey,
+                create2_deployer,
+                strategy,
+            );
 
             let value = tx.value.unwrap_or_default();
             let input = tx.inner.input.into_input().unwrap_or_default();
+            let tx_kind = tx.inner.to.expect("set by builder");
 
             let trace = match tx_kind {
                 TxKind::Create => {
-                    let deploy_result = executor.deploy(sender, input, value, None);
+                    let deploy_result = executor.deploy(from, input, value, None);
                     TraceResult::try_from(deploy_result)?
                 }
                 TxKind::Call(to) => TraceResult::from_raw(
-                    executor.transact_raw(sender, to, input, value)?,
+                    executor.transact_raw(from, to, input, value)?,
                     TraceKind::Execution,
                 ),
             };
 
-            handle_traces(trace, &config, chain, labels, debug, decode_internal).await?;
+            handle_traces(
+                trace,
+                &config,
+                chain,
+                labels,
+                with_local_artifacts,
+                debug,
+                decode_internal,
+            )
+            .await?;
 
             return Ok(());
         }
 
-        println!("{}", Cast::new(provider).call(&tx, func.as_ref(), block).await?);
+        sh_println!("{}", Cast::new(provider).call(&tx, func.as_ref(), block).await?)?;
 
         Ok(())
+    }
+}
+
+impl figment::Provider for CallArgs {
+    fn metadata(&self) -> Metadata {
+        Metadata::named("CallArgs")
+    }
+
+    fn data(&self) -> Result<Map<Profile, Dict>, figment::Error> {
+        let mut map = Map::new();
+
+        if self.odyssey {
+            map.insert("odyssey".into(), self.odyssey.into());
+        }
+
+        if let Some(evm_version) = self.evm_version {
+            map.insert("evm_version".into(), figment::value::Value::serialize(evm_version)?);
+        }
+
+        Ok(Map::from([(Config::selected_profile(), map)]))
     }
 }
 

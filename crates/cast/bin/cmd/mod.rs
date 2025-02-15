@@ -1,4 +1,4 @@
-//! Subcommands for cast
+//! `cast` subcommands.
 //!
 //! All subcommands should respect the `foundry_config::Config`.
 //! If a subcommand accepts values that are supported by the `Config`, then the subcommand should
@@ -6,9 +6,12 @@
 //! [`foundry_config::Config`].
 
 pub mod access_list;
+pub mod artifact;
 pub mod bind;
 pub mod call;
+pub mod constructor_args;
 pub mod create2;
+pub mod creation_code;
 pub mod estimate;
 pub mod find_block;
 pub mod interface;

@@ -1,8 +1,7 @@
 use cast::Cast;
 use clap::Parser;
 use eyre::Result;
-use foundry_cli::{opts::RpcOpts, utils};
-use foundry_config::Config;
+use foundry_cli::{opts::RpcOpts, utils, utils::LoadConfig};
 use itertools::Itertools;
 
 /// CLI arguments for `cast rpc`.
@@ -37,7 +36,7 @@ impl RpcArgs {
     pub async fn run(self) -> Result<()> {
         let Self { raw, method, params, rpc } = self;
 
-        let config = Config::from(&rpc);
+        let config = rpc.load_config()?;
         let provider = utils::get_provider(&config)?;
 
         let params = if raw {
@@ -53,7 +52,7 @@ impl RpcArgs {
         } else {
             serde_json::Value::Array(params.into_iter().map(value_or_string).collect())
         };
-        println!("{}", Cast::new(provider).rpc(&method, params).await?);
+        sh_println!("{}", Cast::new(provider).rpc(&method, params).await?)?;
         Ok(())
     }
 }

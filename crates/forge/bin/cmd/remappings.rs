@@ -21,7 +21,7 @@ impl_figment_convert_basic!(RemappingArgs);
 
 impl RemappingArgs {
     pub fn run(self) -> Result<()> {
-        let config = self.try_load_config_emit_warnings()?;
+        let config = self.load_config()?;
 
         if self.pretty {
             let mut groups = BTreeMap::<_, Vec<_>>::new();
@@ -30,20 +30,20 @@ impl RemappingArgs {
             }
             for (group, remappings) in groups {
                 if let Some(group) = group {
-                    println!("Context: {group}");
+                    sh_println!("Context: {group}")?;
                 } else {
-                    println!("Global:");
+                    sh_println!("Global:")?;
                 }
 
                 for mut remapping in remappings {
                     remapping.context = None; // avoid writing context twice
-                    println!("- {remapping}");
+                    sh_println!("- {remapping}")?;
                 }
-                println!();
+                sh_println!()?;
             }
         } else {
             for remapping in config.remappings {
-                println!("{remapping}");
+                sh_println!("{remapping}")?;
             }
         }
 

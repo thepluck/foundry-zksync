@@ -4,7 +4,8 @@ use std::{collections::HashMap, default, fmt::Debug};
 
 use alloy_primitives::{hex, Address};
 use itertools::Itertools;
-use multivm::{
+use zksync_basic_types::{H160, U256};
+use zksync_multivm::{
     vm_1_3_2::zk_evm_1_3_3::zkevm_opcode_defs::RetABI,
     vm_latest::{BootloaderState, HistoryMode, SimpleMemory, ZkSyncVmState},
     zk_evm_latest::{
@@ -20,9 +21,8 @@ use multivm::{
         },
     },
 };
-use zksync_basic_types::{H160, U256};
-use zksync_state::{StoragePtr, WriteStorage};
 use zksync_types::MSG_VALUE_SIMULATOR_ADDRESS;
+use zksync_vm_interface::storage::{StoragePtr, WriteStorage};
 
 use crate::convert::{ConvertAddress, ConvertH256, ConvertU256};
 
@@ -173,7 +173,7 @@ impl FarCallHandler {
                 PrimitiveValue { value: return_fat_ptr.to_u256(), is_pointer: false };
 
             // Just rewriting `code_page` is very error-prone, since the same memory page would be
-            // re-used for decommitments. We'll use a different approach:
+            // reused for decommitments. We'll use a different approach:
             // - Set `previous_code_word` to the value that we want
             // - Set `previous_code_memory_page` to the current code page + `previous_super_pc` to 0
             //   (as it corresponds
@@ -290,13 +290,13 @@ impl MockedCalls {
             if call.address == code_address {
                 let value_matches = call.value.map_or(true, |value| value == actual_value);
                 if !value_matches {
-                    continue
+                    continue;
                 }
 
                 if actual_calldata.starts_with(&call.calldata) {
                     // return early if exact match
                     if call.calldata.len() == actual_calldata.len() {
-                        return Some(call_return_data.clone())
+                        return Some(call_return_data.clone());
                     }
 
                     // else check for partial matches and pick the best
@@ -325,9 +325,9 @@ pub const SELECTOR_L2_ETH_BALANCE_OF: &str = "9cc7f708";
 pub const SELECTOR_SYSTEM_CONTEXT_BLOCK_NUMBER: &str = "42cbb15c";
 /// Selector for `SystemContext::getBlockTimestamp()`
 pub const SELECTOR_SYSTEM_CONTEXT_BLOCK_TIMESTAMP: &str = "796b89b9";
-// Selector for `ContractDeployer::create(bytes32, bytes32, bytes)`
+/// Selector for `ContractDeployer::create(bytes32, bytes32, bytes)`
 pub const SELECTOR_CONTRACT_DEPLOYER_CREATE: &str = "9c4d535b";
-// Selector for `ContractDeployer::create2(bytes32, bytes32, bytes)`
+/// Selector for `ContractDeployer::create2(bytes32, bytes32, bytes)`
 pub const SELECTOR_CONTRACT_DEPLOYER_CREATE2: &str = "3cda3351";
 
 /// Represents a parsed FarCall from the ZK-EVM
@@ -381,7 +381,7 @@ impl ParsedFarCall {
             ParsedFarCall::SimpleCall { calldata, .. } => calldata,
         }[4..];
         if params.is_empty() {
-            return Vec::new()
+            return Vec::new();
         }
 
         params
@@ -397,7 +397,7 @@ impl ParsedFarCall {
             ParsedFarCall::SimpleCall { calldata, .. } => calldata,
         }[4..];
         if params.is_empty() || params.len() < 32 * offset_words {
-            return Vec::new()
+            return Vec::new();
         }
 
         params[32 * offset_words..].to_vec()

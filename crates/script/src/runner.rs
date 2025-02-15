@@ -1,20 +1,22 @@
 use super::ScriptResult;
 use crate::build::ScriptPredeployLibraries;
-use alloy_primitives::{Address, Bytes, TxKind, U256};
-use alloy_rpc_types::TransactionRequest;
+use alloy_eips::eip7702::SignedAuthorization;
+use alloy_primitives::{Address, Bytes, U256};
+use alloy_serde::OtherFields;
 use eyre::Result;
 use foundry_cheatcodes::BroadcastableTransaction;
 use foundry_config::Config;
 use foundry_evm::{
-    constants::{CALLER, DEFAULT_CREATE2_DEPLOYER},
-    executors::{DeployResult, EvmError, ExecutionErr, Executor, RawCallResult},
+    constants::CALLER,
+    executors::{
+        strategy::{DeployLibKind, DeployLibResult},
+        DeployResult, EvmError, ExecutionErr, Executor, RawCallResult,
+    },
     opts::EvmOpts,
     revm::interpreter::{return_ok, InstructionResult},
     traces::{TraceKind, Traces},
 };
-use foundry_zksync_core::ZkTransactionMetadata;
 use std::collections::VecDeque;
-use yansi::Paint;
 
 /// Drives script execution
 #[derive(Debug)]
@@ -59,82 +61,96 @@ impl ScriptRunner {
         let mut library_transactions = VecDeque::new();
         let mut traces = Traces::default();
 
+        // NOTE(zk): below we moved the logic into the strategy
+        // so we can override it in the zksync strategy
+        // Additionally, we have a list of results to register
+        // both the EVM and EraVM deployment
+
         // Deploy libraries
         match libraries {
             ScriptPredeployLibraries::Default(libraries) => libraries.iter().for_each(|code| {
-                let result = self
+                let results = self
                     .executor
-                    .deploy(self.evm_opts.sender, code.clone(), U256::ZERO, None)
-                    .expect("couldn't deploy library")
-                    .raw;
+                    .deploy_library(
+                        self.evm_opts.sender,
+                        DeployLibKind::Create(code.clone()),
+                        U256::ZERO,
+                        None,
+                    )
+                    .expect("couldn't deploy library");
 
-                if let Some(deploy_traces) = result.traces {
-                    traces.push((TraceKind::Deployment, deploy_traces));
+                for DeployLibResult { result, tx } in results {
+                    if let Some(deploy_traces) = result.raw.traces {
+                        traces.push((TraceKind::Deployment, deploy_traces));
+                    }
+
+                    if let Some(transaction) = tx {
+                        library_transactions.push_back(BroadcastableTransaction {
+                            rpc: self.evm_opts.fork_url.clone(),
+                            transaction,
+                        });
+                    }
                 }
-
-                library_transactions.push_back(BroadcastableTransaction {
-                    rpc: self.evm_opts.fork_url.clone(),
-                    transaction: TransactionRequest {
-                        from: Some(self.evm_opts.sender),
-                        input: Some(code.clone()).into(),
-                        nonce: Some(sender_nonce + library_transactions.len() as u64),
-                        ..Default::default()
-                    },
-                    zk_tx: None,
-                })
             }),
             ScriptPredeployLibraries::Create2(libraries, salt) => {
+                let create2_deployer = self.executor.create2_deployer();
                 for library in libraries {
-                    let address =
-                        DEFAULT_CREATE2_DEPLOYER.create2_from_code(salt, library.as_ref());
+                    let address = create2_deployer.create2_from_code(salt, library.as_ref());
                     // Skip if already deployed
                     if !self.executor.is_empty_code(address)? {
                         continue;
                     }
-                    let calldata = [salt.as_ref(), library.as_ref()].concat();
-                    let result = self
+
+                    let results = self
                         .executor
-                        .transact_raw(
+                        .deploy_library(
                             self.evm_opts.sender,
-                            DEFAULT_CREATE2_DEPLOYER,
-                            calldata.clone().into(),
+                            DeployLibKind::Create2(*salt, library.clone()),
                             U256::from(0),
+                            None,
                         )
                         .expect("couldn't deploy library");
 
-                    if let Some(deploy_traces) = result.traces {
-                        traces.push((TraceKind::Deployment, deploy_traces));
+                    for DeployLibResult { result, tx } in results {
+                        if let Some(deploy_traces) = result.raw.traces {
+                            traces.push((TraceKind::Deployment, deploy_traces));
+                        }
+
+                        if let Some(transaction) = tx {
+                            library_transactions.push_back(BroadcastableTransaction {
+                                rpc: self.evm_opts.fork_url.clone(),
+                                transaction,
+                            });
+                        }
                     }
-
-                    library_transactions.push_back(BroadcastableTransaction {
-                        rpc: self.evm_opts.fork_url.clone(),
-                        transaction: TransactionRequest {
-                            from: Some(self.evm_opts.sender),
-                            input: Some(calldata.into()).into(),
-                            nonce: Some(sender_nonce + library_transactions.len() as u64),
-                            to: Some(TxKind::Call(DEFAULT_CREATE2_DEPLOYER)),
-                            ..Default::default()
-                        },
-                        zk_tx: None,
-                    });
                 }
-
-                // Sender nonce is not incremented when performing CALLs. We need to manually
-                // increase it.
-                self.executor.set_nonce(
-                    self.evm_opts.sender,
-                    sender_nonce + library_transactions.len() as u64,
-                )?;
             }
         };
 
         let address = CALLER.create(self.executor.get_nonce(CALLER)?);
-        self.executor.backend_mut().set_test_contract(address);
 
-        self.executor.backend_mut().set_test_contract(address);
         // Set the contracts initial balance before deployment, so it is available during the
         // construction
         self.executor.set_balance(address, self.evm_opts.initial_balance)?;
+
+        // HACK: if the current sender is the default script sender (which is a default value), we
+        // set its nonce to a very large value before deploying the script contract. This
+        // ensures that the nonce increase during this CREATE does not affect deployment
+        // addresses of contracts that are deployed in the script, Otherwise, we'd have a
+        // nonce mismatch during script execution and onchain simulation, potentially
+        // resulting in weird errors like <https://github.com/foundry-rs/foundry/issues/8960>.
+        let prev_sender_nonce = self.executor.get_nonce(self.evm_opts.sender)?;
+        if self.evm_opts.sender == CALLER {
+            self.executor.set_nonce(self.evm_opts.sender, u64::MAX / 2)?;
+        }
+
+        // NOTE(zk): Address recomputed again after the nonce modification as it will
+        // differ in case of evm_opts.sender == CALLER
+        let zk_actual_script_address = CALLER.create(self.executor.get_nonce(CALLER)?);
+        // NOTE(zk): the test contract is set here instead of where upstream does it as
+        // the test contract address needs to be retrieved in order to skip
+        // zkEVM mode for the creation of the test address (and for calls to it later).
+        self.executor.backend_mut().set_test_contract(zk_actual_script_address);
 
         // Deploy an instance of the contract
         let DeployResult {
@@ -145,10 +161,25 @@ impl ScriptRunner {
             .deploy(CALLER, code, U256::ZERO, None)
             .map_err(|err| eyre::eyre!("Failed to deploy script:\n{}", err))?;
 
+        if self.evm_opts.sender == CALLER {
+            self.executor.set_nonce(self.evm_opts.sender, prev_sender_nonce)?;
+        }
+
         traces.extend(constructor_traces.map(|traces| (TraceKind::Deployment, traces)));
+
+        // Script has already been deployed so we can migrate the database to zkEVM storage
+        // in the next runner execution. Additionally we can allow persisting the next nonce update
+        // to simulate EVM behavior where only the tx that deploys the test contract increments the
+        // nonce.
+        if let Some(cheatcodes) = &mut self.executor.inspector.cheatcodes {
+            debug!("script deployed");
+            cheatcodes.strategy.runner.base_contract_deployed(cheatcodes.strategy.context.as_mut());
+        }
 
         // Optionally call the `setUp` function
         let (success, gas_used, labeled_addresses, transactions) = if !setup {
+            // NOTE(zk): keeping upstream code for context. Test contract is only set on this branch
+            // self.executor.backend_mut().set_test_contract(address);
             (true, 0, Default::default(), Some(library_transactions))
         } else {
             match self.executor.setup(Some(self.evm_opts.sender), address, None) {
@@ -211,7 +242,7 @@ impl ScriptRunner {
 
     /// Executes the method that will collect all broadcastable transactions.
     pub fn script(&mut self, address: Address, calldata: Bytes) -> Result<ScriptResult> {
-        self.call(self.evm_opts.sender, address, calldata, U256::ZERO, false)
+        self.call(self.evm_opts.sender, address, calldata, U256::ZERO, None, false)
     }
 
     /// Runs a broadcastable transaction locally and persists its state.
@@ -221,15 +252,25 @@ impl ScriptRunner {
         to: Option<Address>,
         calldata: Option<Bytes>,
         value: Option<U256>,
-        (use_zk, zk_tx): (bool, Option<ZkTransactionMetadata>),
+        authorization_list: Option<Vec<SignedAuthorization>>,
+        other_fields: Option<OtherFields>,
     ) -> Result<ScriptResult> {
-        self.executor.use_zk = use_zk;
-        if let Some(zk_tx) = zk_tx {
-            self.executor.setup_zk_tx(zk_tx);
+        if let Some(other_fields) = other_fields {
+            self.executor.strategy.runner.zksync_set_transaction_context(
+                self.executor.strategy.context.as_mut(),
+                other_fields,
+            );
         }
 
         if let Some(to) = to {
-            self.call(from, to, calldata.unwrap_or_default(), value.unwrap_or(U256::ZERO), true)
+            self.call(
+                from,
+                to,
+                calldata.unwrap_or_default(),
+                value.unwrap_or(U256::ZERO),
+                authorization_list,
+                true,
+            )
         } else if to.is_none() {
             let res = self.executor.deploy(
                 from,
@@ -241,7 +282,7 @@ impl ScriptRunner {
                 Ok(DeployResult { address, raw }) => (address, raw),
                 Err(EvmError::Execution(err)) => {
                     let ExecutionErr { raw, reason } = *err;
-                    println!("{}", format!("\nFailed with `{reason}`:\n").red());
+                    sh_err!("Failed with `{reason}`:\n")?;
                     (Address::ZERO, raw)
                 }
                 Err(e) => eyre::bail!("Failed deploying contract: {e:?}"),
@@ -276,9 +317,20 @@ impl ScriptRunner {
         to: Address,
         calldata: Bytes,
         value: U256,
+        authorization_list: Option<Vec<SignedAuthorization>>,
         commit: bool,
     ) -> Result<ScriptResult> {
-        let mut res = self.executor.call_raw(from, to, calldata.clone(), value)?;
+        let mut res = if let Some(authorization_list) = authorization_list {
+            self.executor.call_raw_with_authorization(
+                from,
+                to,
+                calldata.clone(),
+                value,
+                authorization_list,
+            )?
+        } else {
+            self.executor.call_raw(from, to, calldata.clone(), value)?
+        };
         let mut gas_used = res.gas_used;
 
         // We should only need to calculate realistic gas costs when preparing to broadcast

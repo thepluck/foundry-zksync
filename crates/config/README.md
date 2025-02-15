@@ -86,7 +86,7 @@ gas_reports_ignore = []
 # solc = '0.8.10'
 auto_detect_solc = true
 offline = false
-optimizer = true
+optimizer = false
 optimizer_runs = 200
 model_checker = { contracts = { 'a.sol' = [
     'A1',
@@ -100,7 +100,7 @@ model_checker = { contracts = { 'a.sol' = [
 ], timeout = 10000 }
 verbosity = 0
 eth_rpc_url = "https://example.com/"
-# Setting this option enables decoding of error traces from mainnet deployed / verfied contracts via etherscan
+# Setting this option enables decoding of error traces from mainnet deployed / verified contracts via etherscan
 etherscan_api_key = "YOURETHERSCANAPIKEY"
 # ignore solc warnings for missing license and exceeded contract size
 # known error codes are: ["unreachable", "unused-return", "unused-param", "unused-var", "code-size", "shadowing", "func-mutability", "license", "pragma-solidity", "virtual-interfaces", "same-varname", "too-many-warnings", "constructor-visibility", "init-code-size", "missing-receive-ether", "unnamed-return", "transient-storage"]
@@ -115,7 +115,7 @@ no_match_contract = "Bar"
 match_path = "*/Foo*"
 no_match_path = "*/Bar*"
 no_match_coverage = "Baz"
-# Number of threads to use. Not set or zero specifies the number of logical cores.
+# Number of threads to use. Specifying 0 defaults to the number of logical cores.
 threads = 0
 # whether to show test execution progress
 show_progress = true
@@ -157,9 +157,9 @@ no_storage_caching = false
 # Whether to store the referenced sources in the metadata as literal data.
 use_literal_content = false
 # use ipfs method to generate the metadata hash, solc's default.
-# To not include the metadata hash, to allow for deterministic code: https://docs.soliditylang.org/en/latest/metadata.html, use "none"
+# To not include the metadata hash, to allow for deterministic code: https://docs.soliditylang.org/en/latest/metadata.html, use "none" (evm compilation only, field will be ignored for zksync)
 bytecode_hash = "ipfs"
-# Whether to append the metadata hash to the bytecode
+# Whether to append the CBOR-encoded metadata file.
 cbor_metadata = true
 # How to treat revert (and require) reason strings.
 # Possible values are: "default", "strip", "debug" and "verboseDebug".
@@ -228,11 +228,12 @@ The `zksync` settings must be prefixed with the profile they correspond to:
 compile = false 
 # Enable zkVM at startup, needs `compile = true` to have effect
 startup = true
-# By default the latest version is used
+# By default the latest supported version is used
 zksolc = "1.5.0" 
 # By default the corresponding solc patched version from matter-labs is used
 solc_path = "./solc-0.8.23-1.0.1"
-bytecode_hash = "none" 
+# By default, no value is passed and the default for the compiler (keccak256) will be used
+hash_type = "none"
 # Allow compiler to use mode 'z' if contracts won't fit in the EraVM bytecode 
 # size limitations
 fallback_oz = false 
@@ -240,8 +241,6 @@ fallback_oz = false
 enable_eravm_extensions = false
 # Force compilation via EVMLA instead of Yul codegen pipeline
 force_evmla = false 
-# List of globs that match contracts to avoid compiling with zksolc
-avoid_contracts = []
 # Enable optimizer on zksolc (defaults to true)
 optimizer = true 
 # zksolc optimizer mode (0 | 1 | 2 | 3 | s | z)

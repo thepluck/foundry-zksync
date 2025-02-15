@@ -1,7 +1,9 @@
-use std::path::PathBuf;
+use std::{collections::HashSet, path::PathBuf};
 
+use alloy_primitives::{hex, Address, Bytes};
 use clap::Parser;
-use foundry_config::ZkSyncConfig;
+use era_solc::standard_json::input::settings::{error_type::ErrorType, warning_type::WarningType};
+use foundry_config::zksync::ZkSyncConfig;
 use serde::Serialize;
 
 #[derive(Clone, Debug, Default, Serialize, Parser)]
@@ -80,12 +82,6 @@ pub struct ZkSyncArgs {
     )]
     pub fallback_oz: Option<bool>,
 
-    /// Detect missing libraries, instead of erroring
-    ///
-    /// Currently unused
-    #[clap(long = "zk-detect-missing-libraries")]
-    pub detect_missing_libraries: bool,
-
     /// Set the LLVM optimization parameter `-O[0 | 1 | 2 | 3 | s | z]`.
     /// Use `3` for best performance and `z` for minimal size.
     #[clap(
@@ -101,9 +97,44 @@ pub struct ZkSyncArgs {
     #[clap(long = "zk-optimizer")]
     pub optimizer: bool,
 
-    /// Contracts to avoid compiling on zkSync
-    #[clap(long = "zk-avoid-contracts", visible_alias = "avoid-contracts", value_delimiter = ',')]
-    pub avoid_contracts: Option<Vec<String>>,
+    /// Paymaster address
+    #[clap(
+        long = "zk-paymaster-address",
+        value_name = "PAYMASTER_ADDRESS",
+        visible_alias = "paymaster-address"
+    )]
+    pub paymaster_address: Option<Address>,
+
+    /// Paymaster input
+    #[clap(
+        long = "zk-paymaster-input",
+        value_name = "PAYMASTER_INPUT",
+        visible_alias = "paymaster-input",
+        value_parser = parse_hex_bytes
+    )]
+    pub paymaster_input: Option<Bytes>,
+
+    /// Set the warnings to suppress for zksolc.
+    #[clap(
+        long = "zk-suppressed-warnings",
+        alias = "suppressed-warnings",
+        visible_alias = "suppress-warnings",
+        value_delimiter = ',',
+        help = "Set the warnings to suppress for zksolc, possible values: [txorigin, assemblycreate]"
+    )]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suppressed_warnings: Option<Vec<WarningType>>,
+
+    /// Set the errors to suppress for zksolc.
+    #[clap(
+        long = "zk-suppressed-errors",
+        alias = "suppressed-errors",
+        visible_alias = "suppress-errors",
+        value_delimiter = ',',
+        help = "Set the errors to suppress for zksolc, possible values: [sendtransfer]"
+    )]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suppressed_errors: Option<Vec<ErrorType>>,
 }
 
 impl ZkSyncArgs {
@@ -129,18 +160,25 @@ impl ZkSyncArgs {
         set_if_some!(self.llvm_options.clone(), zksync.llvm_options);
         set_if_some!(self.force_evmla, zksync.force_evmla);
         set_if_some!(self.fallback_oz, zksync.fallback_oz);
-        set_if_some!(
-            self.detect_missing_libraries.then_some(true),
-            zksync.detect_missing_libraries
-        );
-        set_if_some!(self.avoid_contracts.clone(), zksync.avoid_contracts);
 
         set_if_some!(self.optimizer.then_some(true), zksync.optimizer);
         set_if_some!(
             self.optimizer_mode.as_ref().and_then(|mode| mode.parse::<char>().ok()),
             zksync.optimizer_mode
         );
+        let suppressed_warnings = self
+            .suppressed_warnings
+            .clone()
+            .map(|values| values.into_iter().collect::<HashSet<_>>());
+        set_if_some!(suppressed_warnings, zksync.suppressed_warnings);
+        let suppressed_errors =
+            self.suppressed_errors.clone().map(|values| values.into_iter().collect::<HashSet<_>>());
+        set_if_some!(suppressed_errors, zksync.suppressed_errors);
 
         zksync
     }
+}
+
+fn parse_hex_bytes(s: &str) -> Result<Bytes, String> {
+    hex::decode(s).map(Bytes::from).map_err(|e| format!("Invalid hex string: {e}"))
 }

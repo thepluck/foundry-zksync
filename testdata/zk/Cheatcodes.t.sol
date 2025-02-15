@@ -33,6 +33,16 @@ contract Mock {
     }
 }
 
+contract Reverter {
+    function revertWithMessage() public pure {
+        revert("test");
+    }
+
+    function nestedRevert(Reverter other) public pure {
+        other.revertWithMessage();
+    }
+}
+
 interface IMyProxyCaller {
     function transact(uint8 _data) external;
 }
@@ -47,6 +57,32 @@ contract MyProxyCaller {
     function transact() public {
         IMyProxyCaller(inner).transact(10);
     }
+}
+
+contract Proxy {
+    InnerProxy innerProxy;
+
+    constructor(InnerProxy _innerProxy) {
+        innerProxy = _innerProxy;
+    }
+
+    function proxyCall(ICaller caller) public {
+        innerProxy.proxyCall(caller);
+    }
+}
+
+contract InnerProxy {
+    function proxyCall(ICaller caller) public {
+        caller.call(10);
+    }
+}
+
+interface ICaller {
+    function call(uint8 _value) external;
+}
+
+contract Caller is ICaller {
+    function call(uint8 _value) external {}
 }
 
 contract Emitter {
@@ -127,6 +163,14 @@ contract ZkCheatcodesTest is DSTest {
         require(vm.getNonce(TEST_ADDRESS) == 0, "era nonce mismatch");
     }
 
+    function testZkCheatcodesGetCode() public {
+        string memory contractName = "ConstantNumber";
+        getCodeCheck(contractName, "zkout");
+
+        vm.zkVm(false);
+        getCodeCheck(contractName, "out");
+    }
+
     function testZkCheatcodesEtch() public {
         vm.selectFork(forkEra);
 
@@ -170,6 +214,23 @@ contract ZkCheatcodesTest is DSTest {
         vm.expectEmit(true, true, true, true);
         emit EventFunction(emitter.FUNCTION_MESSAGE());
         emitter.functionEmit();
+    }
+
+    function testExpectRevert() public {
+        vm.expectRevert();
+        revert("test");
+    }
+
+    function testFailExpectRevertDeeperDepthsWithDefaultConfig() public {
+        Reverter reverter = new Reverter();
+        vm.expectRevert();
+        reverter.nestedRevert(reverter);
+    }
+
+    function testExpectRevertDeeperDepthsWithInternalRevertsEnabled() public {
+        Reverter reverter = new Reverter();
+        vm.expectRevert();
+        reverter.nestedRevert(reverter);
     }
 
     function testZkCheatcodesValueFunctionMockReturn() public {
@@ -260,6 +321,27 @@ contract ZkCheatcodesTest is DSTest {
 
         assertEq(zkvmEntries.length, evmEntries.length);
     }
+
+    function testExpectCallCountsTopMostCallOnce() public {
+        InnerProxy innerProxy = new InnerProxy();
+        Proxy proxy = new Proxy(innerProxy);
+        Caller caller = new Caller();
+        vm.expectCall(address(proxy), abi.encodeCall(proxy.proxyCall, (caller)), 1);
+        vm.expectCall(address(innerProxy), abi.encodeCall(innerProxy.proxyCall, (caller)), 1);
+        vm.expectCall(address(caller), abi.encodeCall(caller.call, (10)), 1);
+        proxy.proxyCall(caller);
+    }
+
+    // Utility function
+    function getCodeCheck(string memory contractName, string memory outDir) internal {
+        bytes memory bytecode = vm.getCode(contractName);
+
+        string memory artifactPath = string.concat("zk/", outDir, "/", contractName, ".sol/", contractName, ".json");
+        string memory artifact = vm.readFile(artifactPath);
+        bytes memory expectedBytecode = vm.parseJsonBytes(artifact, ".bytecode.object");
+
+        assertEq(bytecode, expectedBytecode, "code for the contract was incorrect");
+    }
 }
 
 contract UsesCheatcodes {
@@ -267,9 +349,17 @@ contract UsesCheatcodes {
         return vm.getNonce(target);
     }
 
+    function getZkTransactionNonce(Vm vm, address target) public view returns (uint64) {
+        return vm.zkGetTransactionNonce(target);
+    }
+
+    function getZkDeploymentNonce(Vm vm, address target) public view returns (uint64) {
+        return vm.zkGetDeploymentNonce(target);
+    }
+
     function getZkBalance(Vm vm, address target) public view returns (uint256) {
         vm.zkVm(true);
-        getNonce(vm, target);
+        getZkTransactionNonce(vm, target);
         return target.balance;
     }
 }
@@ -291,12 +381,12 @@ contract ZkCheatcodesInZkVmTest is DSTest {
         address target = address(this);
 
         vm.expectRevert();
-        helper.getNonce(vm, target);
+        helper.getZkTransactionNonce(vm, target);
     }
 
     function testCallVmAfterDisableZkVm() external {
         address target = address(this);
-        uint64 expected = vm.getNonce(target);
+        uint64 expected = vm.zkGetTransactionNonce(target);
 
         vm.zkVm(false);
         uint64 got = helper.getNonce(vm, target);

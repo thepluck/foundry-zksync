@@ -15,8 +15,9 @@ forgetest_async!(can_deploy_via_create2, |prj, cmd| {
         "Create2Script",
         None,
         2,
-        Some(&["-vvvvv"]),
-    );
+        Some(&["-vvvvv", "--broadcast"]),
+    )
+    .await;
 });
 
 fn setup_create2_prj(prj: &mut TestProject) {

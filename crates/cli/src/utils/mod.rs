@@ -2,9 +2,16 @@ use alloy_json_abi::JsonAbi;
 use alloy_primitives::U256;
 use alloy_provider::{network::AnyNetwork, Provider};
 use alloy_transport::Transport;
+use alloy_zksync::network::Zksync;
 use eyre::{ContextCompat, Result};
-use foundry_common::provider::{ProviderBuilder, RetryProvider};
+use foundry_common::{
+    provider::{ProviderBuilder, RetryProvider},
+    shell,
+};
 use foundry_config::{Chain, Config};
+use foundry_evm::executors::strategy::ExecutorStrategy;
+use foundry_strategy_zksync::ZksyncExecutorStrategyBuilder;
+use serde::de::DeserializeOwned;
 use std::{
     ffi::OsStr,
     future::Future,
@@ -86,6 +93,22 @@ pub fn get_provider(config: &Config) -> Result<RetryProvider> {
     get_provider_builder(config)?.build()
 }
 
+pub fn get_executor_strategy(config: &Config) -> ExecutorStrategy {
+    if config.zksync.should_compile() {
+        info!("using zksync strategy");
+        ExecutorStrategy::new_zksync()
+    } else {
+        info!("using evm strategy");
+        ExecutorStrategy::new_evm()
+    }
+}
+
+/// Returns a [RetryProvider] instantiated using [Config]'s
+/// RPC for ZKsync
+pub fn get_provider_zksync(config: &Config) -> Result<RetryProvider<Zksync>> {
+    get_provider_builder(config)?.build_zksync()
+}
+
 /// Returns a [ProviderBuilder] instantiated using [Config] values.
 ///
 /// Defaults to `http://localhost:8545` and `Mainnet`.
@@ -100,6 +123,14 @@ pub fn get_provider_builder(config: &Config) -> Result<ProviderBuilder> {
     let jwt = config.get_rpc_jwt_secret()?;
     if let Some(jwt) = jwt {
         builder = builder.jwt(jwt.as_ref());
+    }
+
+    if let Some(rpc_timeout) = config.eth_rpc_timeout {
+        builder = builder.timeout(Duration::from_secs(rpc_timeout));
+    }
+
+    if let Some(rpc_headers) = config.eth_rpc_headers.clone() {
+        builder = builder.headers(rpc_headers);
     }
 
     Ok(builder)
@@ -133,6 +164,11 @@ pub fn parse_ether_value(value: &str) -> Result<U256> {
     })
 }
 
+/// Parses a `T` from a string using [`serde_json::from_str`].
+pub fn parse_json<T: DeserializeOwned>(value: &str) -> serde_json::Result<T> {
+    serde_json::from_str(value)
+}
+
 /// Parses a `Duration` from a &str
 pub fn parse_delay(delay: &str) -> Result<Duration> {
     let delay = if delay.ends_with("ms") {
@@ -161,23 +197,6 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
     rt.block_on(future)
 }
 
-/// Conditionally print a message
-///
-/// This macro accepts a predicate and the message to print if the predicate is tru
-///
-/// ```ignore
-/// let quiet = true;
-/// p_println!(!quiet => "message");
-/// ```
-#[macro_export]
-macro_rules! p_println {
-    ($p:expr => $($arg:tt)*) => {{
-        if $p {
-            println!($($arg)*)
-        }
-    }}
-}
-
 /// Loads a dotenv file, from the cwd and the project root, ignoring potential failure.
 ///
 /// We could use `warn!` here, but that would imply that the dotenv file can't configure
@@ -191,9 +210,9 @@ pub fn load_dotenv() {
     };
 
     // we only want the .env file of the cwd and project root
-    // `find_project_root_path` calls `current_dir` internally so both paths are either both `Ok` or
+    // `find_project_root` calls `current_dir` internally so both paths are either both `Ok` or
     // both `Err`
-    if let (Ok(cwd), Ok(prj_root)) = (std::env::current_dir(), find_project_root_path(None)) {
+    if let (Ok(cwd), Ok(prj_root)) = (std::env::current_dir(), find_project_root(None)) {
         load(&prj_root);
         if cwd != prj_root {
             // prj root and cwd can be identical
@@ -282,12 +301,12 @@ pub struct Git<'a> {
 impl<'a> Git<'a> {
     #[inline]
     pub fn new(root: &'a Path) -> Self {
-        Self { root, quiet: false, shallow: false }
+        Self { root, quiet: shell::is_quiet(), shallow: false }
     }
 
     #[inline]
     pub fn from_config(config: &'a Config) -> Self {
-        Self::new(config.root.0.as_path())
+        Self::new(config.root.as_path())
     }
 
     pub fn root_of(relative_to: &Path) -> Result<PathBuf> {
@@ -444,8 +463,8 @@ impl<'a> Git<'a> {
         self.cmd().args(["status", "--porcelain"]).exec().map(|out| out.stdout.is_empty())
     }
 
-    pub fn has_branch(self, branch: impl AsRef<OsStr>) -> Result<bool> {
-        self.cmd()
+    pub fn has_branch(self, branch: impl AsRef<OsStr>, at: &Path) -> Result<bool> {
+        self.cmd_at(at)
             .args(["branch", "--list", "--no-color"])
             .arg(branch)
             .get_stdout_lossy()
@@ -463,10 +482,7 @@ and it requires clean working and staging areas, including no untracked files.
 
 Check the current git repository's status with `git status`.
 Then, you can track files with `git add ...` and then commit them with `git commit`,
-ignore them in the `.gitignore` file, or run this command again with the `--no-commit` flag.
-
-If none of the previous steps worked, please open an issue at:
-https://github.com/foundry-rs/foundry/issues/new/choose"
+ignore them in the `.gitignore` file, or run this command again with the `--no-commit` flag."
             ))
         }
     }
@@ -570,6 +586,12 @@ https://github.com/foundry-rs/foundry/issues/new/choose"
         cmd
     }
 
+    pub fn cmd_at(self, path: &Path) -> Command {
+        let mut cmd = Self::cmd_no_root();
+        cmd.current_dir(path);
+        cmd
+    }
+
     pub fn cmd_no_root() -> Command {
         let mut cmd = Command::new("git");
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -602,7 +624,7 @@ mod tests {
         assert!(!p.is_sol_test());
     }
 
-    // loads .env from cwd and project dir, See [`find_project_root_path()`]
+    // loads .env from cwd and project dir, See [`find_project_root()`]
     #[test]
     fn can_load_dotenv() {
         let temp = tempdir().unwrap();

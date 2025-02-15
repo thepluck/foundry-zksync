@@ -1,6 +1,6 @@
 name: Bug report
 description: File a bug report
-labels: ["T-bug"]
+labels: ["bug 🐛", "needs triage ♟️"]
 body:
     - type: markdown
       attributes:
@@ -16,9 +16,7 @@ body:
           options:
               - Forge
               - Cast
-              - Anvil
               - Foundryup
-              - Chisel
               - Other (please describe)
       validations:
           required: true
@@ -32,6 +30,10 @@ body:
       attributes:
           label: What version of Foundry are you on?
           placeholder: "Run forge --version and paste the output here"
+    - type: input
+      attributes:
+          label: What version of Foundryup are you on?
+          placeholder: "Run foundryup --version and paste the output here"
     - type: input
       attributes:
           label: What command(s) is the bug in?

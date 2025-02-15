@@ -32,7 +32,11 @@ use alloy_primitives::hex;
 use eyre::Result;
 use url::Url;
 use zksync_basic_types::U256;
-use zksync_web3_rs::types::H256;
+use zksync_types::H256;
+
+/// Max l2 gas limit to use in transactions. Determined empirically to be good enough
+/// for all use cases.
+pub const MAX_L2_GAS_LIMIT: u64 = ((u32::MAX >> 1) as u64) * 2;
 
 /// Gets the RPC URL for Ethereum.
 ///
@@ -111,11 +115,7 @@ pub fn fix_l2_gas_price(gas_price: U256) -> U256 {
     U256::max(gas_price, U256::from(260_000_000))
 }
 
-/// Limits the gas_limit propotional to a user's available balance given the gas_price.
-/// Additionally, fixes the gas limit to be maxmium of 2^31, which is below the VM gas limit of
-/// 2^32. This is required so the bootloader does not throw an error for not having enough balance
-/// to pay for gas.
-///
+/// Limits the gas_limit proportional to a user's available balance given the gas_price.
 /// TODO: Remove this later to allow for dynamic gas prices that work in both tests and scripts.
 pub fn fix_l2_gas_limit(
     proposed_gas_limit: U256,
@@ -130,5 +130,5 @@ pub fn fix_l2_gas_limit(
         U256::min(proposed_gas_limit, max_gas_limit)
     };
 
-    U256::min(gas_limit, U256::from(u32::MAX >> 1))
+    U256::min(gas_limit, U256::from(MAX_L2_GAS_LIMIT))
 }

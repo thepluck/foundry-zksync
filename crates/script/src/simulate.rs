@@ -1,29 +1,27 @@
 use super::{
-    multi_sequence::MultiChainSequence,
-    providers::ProvidersManager,
-    runner::ScriptRunner,
-    sequence::{ScriptSequence, ScriptSequenceKind},
-    transaction::TransactionWithMetadata,
+    multi_sequence::MultiChainSequence, providers::ProvidersManager, runner::ScriptRunner,
+    sequence::ScriptSequenceKind, transaction::ScriptTransactionBuilder,
 };
 use crate::{
     broadcast::{estimate_gas, BundledState},
     build::LinkedBuildData,
     execute::{ExecutionArtifacts, ExecutionData},
     sequence::get_commit_hash,
-    transaction::ZkTransaction,
     ScriptArgs, ScriptConfig, ScriptResult,
 };
 use alloy_network::TransactionBuilder;
-use alloy_primitives::{utils::format_units, Address, TxKind, U256};
+use alloy_primitives::{map::HashMap, utils::format_units, Address, Bytes, TxKind, U256};
+use dialoguer::Confirm;
 use eyre::{Context, Result};
-use foundry_cheatcodes::{BroadcastableTransactions, ScriptWallets};
+use forge_script_sequence::{ScriptSequence, TransactionWithMetadata};
+use foundry_cheatcodes::Wallets;
 use foundry_cli::utils::{has_different_gas_calc, now};
-use foundry_common::{get_contract_name, shell, ContractData};
+use foundry_common::{shell, ContractData, TransactionMaybeSigned};
 use foundry_evm::traces::{decode_trace_arena, render_trace_arena};
 use futures::future::{join_all, try_join_all};
 use parking_lot::RwLock;
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, VecDeque},
     sync::Arc,
 };
 
@@ -35,7 +33,7 @@ use std::{
 pub struct PreSimulationState {
     pub args: ScriptArgs,
     pub script_config: ScriptConfig,
-    pub script_wallets: ScriptWallets,
+    pub script_wallets: Wallets,
     pub build_data: LinkedBuildData,
     pub execution_data: ExecutionData,
     pub execution_result: ScriptResult,
@@ -49,16 +47,41 @@ impl PreSimulationState {
     ///
     /// Both modes will panic if any of the transactions have None for the `rpc` field.
     pub async fn fill_metadata(self) -> Result<FilledTransactionsState> {
-        let transactions = if let Some(txs) = self.execution_result.transactions.as_ref() {
-            if self.args.skip_simulation {
-                shell::println("\nSKIPPING ON CHAIN SIMULATION.")?;
-                self.no_simulation(txs.clone())?
-            } else {
-                self.onchain_simulation(txs.clone()).await?
-            }
+        let address_to_abi = self.build_address_to_abi_map();
+
+        let mut transactions = self
+            .execution_result
+            .transactions
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tx| {
+                let rpc = tx.rpc.expect("missing broadcastable tx rpc url");
+                let sender = tx.transaction.from().expect("all transactions should have a sender");
+                let nonce = tx.transaction.nonce().expect("all transactions should have a sender");
+                let to = tx.transaction.to();
+
+                let mut builder = ScriptTransactionBuilder::new(tx.transaction, rpc);
+
+                if let Some(TxKind::Call(_)) = to {
+                    builder.set_call(
+                        &address_to_abi,
+                        &self.execution_artifacts.decoder,
+                        self.script_config.evm_opts.create2_deployer,
+                    )?;
+                } else {
+                    builder.set_create(false, sender.create(nonce), &address_to_abi)?;
+                }
+
+                Ok(builder.build())
+            })
+            .collect::<Result<VecDeque<_>>>()?;
+
+        if self.args.skip_simulation {
+            sh_println!("\nSKIPPING ON CHAIN SIMULATION.")?;
         } else {
-            VecDeque::new()
-        };
+            transactions = self.simulate_and_fill(transactions).await?;
+        }
 
         Ok(FilledTransactionsState {
             args: self.args,
@@ -74,9 +97,9 @@ impl PreSimulationState {
     /// transactions in those environments.
     ///
     /// Collects gas usage and metadata for each transaction.
-    pub async fn onchain_simulation(
+    pub async fn simulate_and_fill(
         &self,
-        transactions: BroadcastableTransactions,
+        transactions: VecDeque<TransactionWithMetadata>,
     ) -> Result<VecDeque<TransactionWithMetadata>> {
         trace!(target: "script", "executing onchain simulation");
 
@@ -88,90 +111,90 @@ impl PreSimulationState {
                 .collect::<HashMap<_, _>>(),
         );
 
-        let address_to_abi = self.build_address_to_abi_map();
-
         let mut final_txs = VecDeque::new();
 
         // Executes all transactions from the different forks concurrently.
         let futs = transactions
             .into_iter()
-            .map(|transaction| async {
-                let rpc = transaction.rpc.expect("missing broadcastable tx rpc url");
-                let mut runner = runners.get(&rpc).expect("invalid rpc url").write();
+            .map(|mut transaction| async {
+                let mut runner = runners.get(&transaction.rpc).expect("invalid rpc url").write();
+                let tx = transaction.tx_mut();
 
-                let zk = transaction.zk_tx;
-                let mut tx = transaction.transaction;
-                let to = if let Some(TxKind::Call(to)) = tx.to { Some(to) } else { None };
+                let other_fields = match &tx {
+                    TransactionMaybeSigned::Unsigned(tx) => Some(tx.other.clone()),
+                    _ => None,
+                };
+                let to = if let Some(TxKind::Call(to)) = tx.to() { Some(to) } else { None };
                 let result = runner
                     .simulate(
-                        tx.from
+                        tx.from()
                             .expect("transaction doesn't have a `from` address at execution time"),
                         to,
-                        tx.input.clone().into_input(),
-                        tx.value,
-                        (self.script_config.config.zksync.run_in_zk_mode(), zk.clone()),
+                        tx.input().map(Bytes::copy_from_slice),
+                        tx.value(),
+                        tx.authorization_list(),
+                        other_fields,
                     )
                     .wrap_err("Internal EVM error during simulation")?;
 
                 if !result.success {
-                    return Ok((None, result.traces));
+                    return Ok((None, false, result.traces));
                 }
-
-                let created_contracts = result.get_created_contracts();
 
                 // Simulate mining the transaction if the user passes `--slow`.
                 if self.args.slow {
                     runner.executor.env_mut().block.number += U256::from(1);
                 }
 
-                let is_fixed_gas_limit = tx.gas.is_some();
-                match tx.gas {
-                    // If tx.gas is already set that means it was specified in script
-                    Some(gas) => {
-                        println!("Gas limit was set in script to {gas}");
-                    }
-                    // We inflate the gas used by the user specified percentage
-                    None => {
-                        let gas = result.gas_used * self.args.gas_estimate_multiplier / 100;
-                        tx.gas = Some(gas as u128);
-                    }
-                }
-                let tx = TransactionWithMetadata::new(
-                    tx,
-                    rpc,
-                    &result,
-                    &address_to_abi,
-                    &self.execution_artifacts.decoder,
-                    created_contracts,
-                    is_fixed_gas_limit,
-                    zk.map(|zk_tx| ZkTransaction {
-                        factory_deps: zk_tx.factory_deps,
-                        paymaster_data: zk_tx.paymaster_data,
-                    }),
-                )?;
+                let is_noop_tx = if let Some(to) = to {
+                    runner.executor.is_empty_code(to)? && tx.value().unwrap_or_default().is_zero()
+                } else {
+                    false
+                };
 
-                eyre::Ok((Some(tx), result.traces))
+                let transaction = ScriptTransactionBuilder::from(transaction)
+                    .with_execution_result(&result, self.args.gas_estimate_multiplier)
+                    .build();
+
+                eyre::Ok((Some(transaction), is_noop_tx, result.traces))
             })
             .collect::<Vec<_>>();
 
-        if self.script_config.evm_opts.verbosity > 3 {
-            println!("==========================");
-            println!("Simulated On-chain Traces:\n");
+        if !shell::is_json() && self.script_config.evm_opts.verbosity > 3 {
+            sh_println!("==========================")?;
+            sh_println!("Simulated On-chain Traces:\n")?;
         }
 
         let mut abort = false;
         for res in join_all(futs).await {
-            let (tx, mut traces) = res?;
+            let (tx, is_noop_tx, mut traces) = res?;
 
             // Transaction will be `None`, if execution didn't pass.
             if tx.is_none() || self.script_config.evm_opts.verbosity > 3 {
                 for (_, trace) in &mut traces {
                     decode_trace_arena(trace, &self.execution_artifacts.decoder).await?;
-                    println!("{}", render_trace_arena(trace));
+                    sh_println!("{}", render_trace_arena(trace))?;
                 }
             }
 
             if let Some(tx) = tx {
+                if is_noop_tx {
+                    let to = tx.contract_address.unwrap();
+                    sh_warn!(
+                        "Script contains a transaction to {to} which does not contain any code."
+                    )?;
+
+                    // Only prompt if we're broadcasting and we've not disabled interactivity.
+                    if self.args.should_broadcast() &&
+                        !self.args.non_interactive &&
+                        !Confirm::new()
+                            .with_prompt("Do you wish to continue?".to_string())
+                            .interact()?
+                    {
+                        eyre::bail!("User canceled the script.");
+                    }
+                }
+
                 final_txs.push_back(tx);
             } else {
                 abort = true;
@@ -192,9 +215,8 @@ impl PreSimulationState {
             .contracts
             .iter()
             .filter_map(move |(addr, contract_id)| {
-                let contract_name = get_contract_name(contract_id);
                 if let Ok(Some((_, data))) =
-                    self.build_data.known_contracts.find_by_name_or_identifier(contract_name)
+                    self.build_data.known_contracts.find_by_name_or_identifier(contract_id)
                 {
                     return Some((*addr, data));
                 }
@@ -206,10 +228,11 @@ impl PreSimulationState {
     /// Build [ScriptRunner] forking given RPC for each RPC used in the script.
     async fn build_runners(&self) -> Result<Vec<(String, ScriptRunner)>> {
         let rpcs = self.execution_artifacts.rpc_data.total_rpcs.clone();
-        if !shell::verbosity().is_silent() {
+
+        if !shell::is_json() {
             let n = rpcs.len();
             let s = if n != 1 { "s" } else { "" };
-            println!("\n## Setting up {n} EVM{s}.");
+            sh_println!("\n## Setting up {n} EVM{s}.")?;
         }
 
         let futs = rpcs.into_iter().map(|rpc| async move {
@@ -220,26 +243,6 @@ impl PreSimulationState {
         });
         try_join_all(futs).await
     }
-
-    /// If simulation is disabled, converts transactions into [TransactionWithMetadata] type
-    /// skipping metadata filling.
-    fn no_simulation(
-        &self,
-        transactions: BroadcastableTransactions,
-    ) -> Result<VecDeque<TransactionWithMetadata>> {
-        Ok(transactions
-            .into_iter()
-            .map(|btx| {
-                let mut tx = TransactionWithMetadata::from_tx_request(btx.transaction);
-                tx.zk = btx.zk_tx.map(|metadata| ZkTransaction {
-                    factory_deps: metadata.factory_deps,
-                    paymaster_data: metadata.paymaster_data,
-                });
-                tx.rpc = btx.rpc.expect("missing broadcastable tx rpc url");
-                tx
-            })
-            .collect())
-    }
 }
 
 /// At this point we have converted transactions collected during script execution to
@@ -248,7 +251,7 @@ impl PreSimulationState {
 pub struct FilledTransactionsState {
     pub args: ScriptArgs,
     pub script_config: ScriptConfig,
-    pub script_wallets: ScriptWallets,
+    pub script_wallets: Wallets,
     pub build_data: LinkedBuildData,
     pub execution_artifacts: ExecutionArtifacts,
     pub transactions: VecDeque<TransactionWithMetadata>,
@@ -267,7 +270,7 @@ impl FilledTransactionsState {
             eyre::bail!("Multi-chain deployment is not supported with libraries.");
         }
 
-        let mut total_gas_per_rpc: HashMap<String, u128> = HashMap::new();
+        let mut total_gas_per_rpc: HashMap<String, u128> = HashMap::default();
 
         // Batches sequence of transactions from different rpcs.
         let mut new_sequence = VecDeque::new();
@@ -279,43 +282,51 @@ impl FilledTransactionsState {
         let mut txes_iter = self.transactions.clone().into_iter().peekable();
 
         while let Some(mut tx) = txes_iter.next() {
-            let tx_rpc = tx.rpc.clone();
+            let tx_rpc = tx.rpc.to_owned();
             let provider_info = manager.get_or_init_provider(&tx.rpc, self.args.legacy).await?;
 
-            // Handles chain specific requirements.
-            tx.transaction.set_chain_id(provider_info.chain);
+            if let Some(tx) = tx.tx_mut().as_unsigned_mut() {
+                // Handles chain specific requirements for unsigned transactions.
+                tx.set_chain_id(provider_info.chain);
+            }
 
             if !self.args.skip_simulation {
                 let tx = tx.tx_mut();
 
                 if has_different_gas_calc(provider_info.chain) {
-                    trace!("estimating with different gas calculation");
-                    let gas = tx.gas.expect("gas is set by simulation.");
+                    // only estimate gas for unsigned transactions
+                    if let Some(tx) = tx.as_unsigned_mut() {
+                        trace!("estimating with different gas calculation");
+                        let gas = tx.gas.expect("gas is set by simulation.");
 
-                    // We are trying to show the user an estimation of the total gas usage.
-                    //
-                    // However, some transactions might depend on previous ones. For
-                    // example, tx1 might deploy a contract that tx2 uses. That
-                    // will result in the following `estimate_gas` call to fail,
-                    // since tx1 hasn't been broadcasted yet.
-                    //
-                    // Not exiting here will not be a problem when actually broadcasting, because
-                    // for chains where `has_different_gas_calc` returns true,
-                    // we await each transaction before broadcasting the next
-                    // one.
-                    if let Err(err) =
-                        estimate_gas(tx, &provider_info.provider, self.args.gas_estimate_multiplier)
-                            .await
-                    {
-                        trace!("gas estimation failed: {err}");
+                        // We are trying to show the user an estimation of the total gas usage.
+                        //
+                        // However, some transactions might depend on previous ones. For
+                        // example, tx1 might deploy a contract that tx2 uses. That
+                        // will result in the following `estimate_gas` call to fail,
+                        // since tx1 hasn't been broadcasted yet.
+                        //
+                        // Not exiting here will not be a problem when actually broadcasting,
+                        // because for chains where `has_different_gas_calc`
+                        // returns true, we await each transaction before
+                        // broadcasting the next one.
+                        if let Err(err) = estimate_gas(
+                            tx,
+                            &provider_info.provider,
+                            self.args.gas_estimate_multiplier,
+                        )
+                        .await
+                        {
+                            trace!("gas estimation failed: {err}");
 
-                        // Restore gas value, since `estimate_gas` will remove it.
-                        tx.set_gas_limit(gas);
+                            // Restore gas value, since `estimate_gas` will remove it.
+                            tx.set_gas_limit(gas);
+                        }
                     }
                 }
 
                 let total_gas = total_gas_per_rpc.entry(tx_rpc.clone()).or_insert(0);
-                *total_gas += tx.gas.expect("gas is set");
+                *total_gas += tx.gas().expect("gas is set");
             }
 
             new_sequence.push_back(tx);
@@ -348,24 +359,34 @@ impl FilledTransactionsState {
                     provider_info.gas_price()?
                 };
 
-                shell::println("\n==========================")?;
-                shell::println(format!("\nChain {}", provider_info.chain))?;
+                let estimated_gas_price_raw = format_units(per_gas, 9)
+                    .unwrap_or_else(|_| "[Could not calculate]".to_string());
+                let estimated_gas_price =
+                    estimated_gas_price_raw.trim_end_matches('0').trim_end_matches('.');
 
-                shell::println(format!(
-                    "\nEstimated gas price: {} gwei",
-                    format_units(per_gas, 9)
-                        .unwrap_or_else(|_| "[Could not calculate]".to_string())
-                        .trim_end_matches('0')
-                        .trim_end_matches('.')
-                ))?;
-                shell::println(format!("\nEstimated total gas used for script: {total_gas}"))?;
-                shell::println(format!(
-                    "\nEstimated amount required: {} ETH",
-                    format_units(total_gas.saturating_mul(per_gas), 18)
-                        .unwrap_or_else(|_| "[Could not calculate]".to_string())
-                        .trim_end_matches('0')
-                ))?;
-                shell::println("\n==========================")?;
+                let estimated_amount_raw = format_units(total_gas.saturating_mul(per_gas), 18)
+                    .unwrap_or_else(|_| "[Could not calculate]".to_string());
+                let estimated_amount = estimated_amount_raw.trim_end_matches('0');
+
+                if !shell::is_json() {
+                    sh_println!("\n==========================")?;
+                    sh_println!("\nChain {}", provider_info.chain)?;
+
+                    sh_println!("\nEstimated gas price: {} gwei", estimated_gas_price)?;
+                    sh_println!("\nEstimated total gas used for script: {total_gas}")?;
+                    sh_println!("\nEstimated amount required: {estimated_amount} ETH",)?;
+                    sh_println!("\n==========================")?;
+                } else {
+                    sh_println!(
+                        "{}",
+                        serde_json::json!({
+                            "chain": provider_info.chain,
+                            "estimated_gas_price": estimated_gas_price,
+                            "estimated_total_gas_used": total_gas,
+                            "estimated_amount_required": estimated_amount,
+                        })
+                    )?;
+                }
             }
         }
 
@@ -411,7 +432,7 @@ impl FilledTransactionsState {
             )?)
         };
 
-        let commit = get_commit_hash(&self.script_config.config.root.0);
+        let commit = get_commit_hash(&self.script_config.config.root);
 
         let libraries = self
             .build_data
@@ -424,7 +445,7 @@ impl FilledTransactionsState {
             })
             .collect();
 
-        Ok(ScriptSequence {
+        let sequence = ScriptSequence {
             transactions,
             returns: self.execution_artifacts.returns.clone(),
             receipts: vec![],
@@ -434,6 +455,7 @@ impl FilledTransactionsState {
             libraries,
             chain,
             commit,
-        })
+        };
+        Ok(sequence)
     }
 }

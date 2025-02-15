@@ -3,7 +3,8 @@
 use crate::{config::*, test_helpers::TEST_DATA_DEFAULT};
 use alloy_primitives::U256;
 use forge::fuzz::CounterExample;
-use foundry_test_utils::Filter;
+use foundry_config::{Config, InvariantConfig};
+use foundry_test_utils::{forgetest_init, str, Filter};
 use std::collections::BTreeMap;
 
 macro_rules! get_counterexample {
@@ -47,8 +48,9 @@ async fn test_invariant_with_alias() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_invariant_filters() {
-    let mut runner = TEST_DATA_DEFAULT.runner();
-    runner.test_options.invariant.runs = 10;
+    let mut runner = TEST_DATA_DEFAULT.runner_with(|config| {
+        config.invariant.runs = 10;
+    });
 
     // Contracts filter tests.
     assert_multiple(
@@ -172,9 +174,10 @@ async fn test_invariant_filters() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_invariant_override() {
     let filter = Filter::new(".*", ".*", ".*fuzz/invariant/common/InvariantReentrancy.t.sol");
-    let mut runner = TEST_DATA_DEFAULT.runner();
-    runner.test_options.invariant.fail_on_revert = false;
-    runner.test_options.invariant.call_override = true;
+    let mut runner = TEST_DATA_DEFAULT.runner_with(|config| {
+        config.invariant.fail_on_revert = false;
+        config.invariant.call_override = true;
+    });
     let results = runner.test_collect(&filter);
     assert_multiple(
         &results,
@@ -188,10 +191,11 @@ async fn test_invariant_override() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_invariant_fail_on_revert() {
     let filter = Filter::new(".*", ".*", ".*fuzz/invariant/common/InvariantHandlerFailure.t.sol");
-    let mut runner = TEST_DATA_DEFAULT.runner();
-    runner.test_options.invariant.fail_on_revert = true;
-    runner.test_options.invariant.runs = 1;
-    runner.test_options.invariant.depth = 10;
+    let mut runner = TEST_DATA_DEFAULT.runner_with(|config| {
+        config.invariant.fail_on_revert = true;
+        config.invariant.runs = 1;
+        config.invariant.depth = 10;
+    });
     let results = runner.test_collect(&filter);
     assert_multiple(
         &results,
@@ -212,9 +216,13 @@ async fn test_invariant_fail_on_revert() {
 #[ignore]
 async fn test_invariant_storage() {
     let filter = Filter::new(".*", ".*", ".*fuzz/invariant/storage/InvariantStorageTest.t.sol");
-    let mut runner = TEST_DATA_DEFAULT.runner();
-    runner.test_options.invariant.depth = 100 + (50 * cfg!(windows) as u32);
-    runner.test_options.fuzz.seed = Some(U256::from(6u32));
+    let mut runner = TEST_DATA_DEFAULT.runner_with(|config| {
+        config.invariant.depth = 100;
+        if cfg!(windows) {
+            config.invariant.depth += 50;
+        }
+        config.fuzz.seed = Some(U256::from(6u32));
+    });
     let results = runner.test_collect(&filter);
     assert_multiple(
         &results,
@@ -253,8 +261,10 @@ async fn test_invariant_inner_contract() {
 #[cfg_attr(windows, ignore = "for some reason there's different rng")]
 async fn test_invariant_shrink() {
     let filter = Filter::new(".*", ".*", ".*fuzz/invariant/common/InvariantInnerContract.t.sol");
-    let mut runner = TEST_DATA_DEFAULT.runner();
-    runner.test_options.fuzz.seed = Some(U256::from(119u32));
+    let mut runner = TEST_DATA_DEFAULT.runner_with(|config| {
+        config.fuzz.seed = Some(U256::from(119u32));
+        config.optimizer = Some(true);
+    });
 
     match get_counterexample!(runner, &filter) {
         CounterExample::Single(_) => panic!("CounterExample should be a sequence."),
@@ -285,23 +295,30 @@ async fn test_invariant_shrink() {
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(windows, ignore = "for some reason there's different rng")]
 async fn test_invariant_assert_shrink() {
-    // ensure assert and require shrinks to same sequence of 3 or less
-    test_shrink("invariant_with_assert").await;
-    test_shrink("invariant_with_require").await;
+    // ensure assert shrinks to same sequence of 2 as require
+    check_shrink_sequence("invariant_with_assert", 2).await;
 }
 
-async fn test_shrink(test_pattern: &str) {
-    let mut opts = TEST_DATA_DEFAULT.test_opts.clone();
-    opts.fuzz.seed = Some(U256::from(100u32));
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(windows, ignore = "for some reason there's different rng")]
+async fn test_invariant_require_shrink() {
+    // ensure require shrinks to same sequence of 2 as assert
+    check_shrink_sequence("invariant_with_require", 2).await;
+}
+
+async fn check_shrink_sequence(test_pattern: &str, expected_len: usize) {
     let filter =
         Filter::new(test_pattern, ".*", ".*fuzz/invariant/common/InvariantShrinkWithAssert.t.sol");
-    let mut runner = TEST_DATA_DEFAULT.runner();
-    runner.test_options = opts;
+    let mut runner = TEST_DATA_DEFAULT.runner_with(|config| {
+        config.fuzz.seed = Some(U256::from(100u32));
+        config.invariant.runs = 1;
+        config.invariant.depth = 15;
+    });
 
     match get_counterexample!(runner, &filter) {
         CounterExample::Single(_) => panic!("CounterExample should be a sequence."),
         CounterExample::Sequence(sequence) => {
-            assert!(sequence.len() <= 3);
+            assert_eq!(sequence.len(), expected_len);
         }
     };
 }
@@ -311,10 +328,11 @@ async fn test_shrink(test_pattern: &str) {
 async fn test_shrink_big_sequence() {
     let filter =
         Filter::new(".*", ".*", ".*fuzz/invariant/common/InvariantShrinkBigSequence.t.sol");
-    let mut runner = TEST_DATA_DEFAULT.runner();
-    runner.test_options.fuzz.seed = Some(U256::from(119u32));
-    runner.test_options.invariant.runs = 1;
-    runner.test_options.invariant.depth = 1000;
+    let mut runner = TEST_DATA_DEFAULT.runner_with(|config| {
+        config.fuzz.seed = Some(U256::from(119u32));
+        config.invariant.runs = 1;
+        config.invariant.depth = 1000;
+    });
 
     let initial_counterexample = runner
         .test_collect(&filter)
@@ -383,11 +401,12 @@ async fn test_shrink_big_sequence() {
 async fn test_shrink_fail_on_revert() {
     let filter =
         Filter::new(".*", ".*", ".*fuzz/invariant/common/InvariantShrinkFailOnRevert.t.sol");
-    let mut runner = TEST_DATA_DEFAULT.runner();
-    runner.test_options.fuzz.seed = Some(U256::from(119u32));
-    runner.test_options.invariant.fail_on_revert = true;
-    runner.test_options.invariant.runs = 1;
-    runner.test_options.invariant.depth = 200;
+    let mut runner = TEST_DATA_DEFAULT.runner_with(|config| {
+        config.fuzz.seed = Some(U256::from(119u32));
+        config.invariant.fail_on_revert = true;
+        config.invariant.runs = 1;
+        config.invariant.depth = 200;
+    });
 
     match get_counterexample!(runner, &filter) {
         CounterExample::Single(_) => panic!("CounterExample should be a sequence."),
@@ -401,8 +420,9 @@ async fn test_shrink_fail_on_revert() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_invariant_preserve_state() {
     let filter = Filter::new(".*", ".*", ".*fuzz/invariant/common/InvariantPreserveState.t.sol");
-    let mut runner = TEST_DATA_DEFAULT.runner();
-    runner.test_options.invariant.fail_on_revert = true;
+    let mut runner = TEST_DATA_DEFAULT.runner_with(|config| {
+        config.invariant.fail_on_revert = true;
+    });
     let results = runner.test_collect(&filter);
     assert_multiple(
         &results,
@@ -445,9 +465,10 @@ async fn test_invariant_with_address_fixture() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_invariant_assume_does_not_revert() {
     let filter = Filter::new(".*", ".*", ".*fuzz/invariant/common/InvariantAssume.t.sol");
-    let mut runner = TEST_DATA_DEFAULT.runner();
-    // Should not treat vm.assume as revert.
-    runner.test_options.invariant.fail_on_revert = true;
+    let mut runner = TEST_DATA_DEFAULT.runner_with(|config| {
+        // Should not treat vm.assume as revert.
+        config.invariant.fail_on_revert = true;
+    });
     let results = runner.test_collect(&filter);
     assert_multiple(
         &results,
@@ -461,10 +482,11 @@ async fn test_invariant_assume_does_not_revert() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_invariant_assume_respects_restrictions() {
     let filter = Filter::new(".*", ".*", ".*fuzz/invariant/common/InvariantAssume.t.sol");
-    let mut runner = TEST_DATA_DEFAULT.runner();
-    runner.test_options.invariant.runs = 1;
-    runner.test_options.invariant.depth = 10;
-    runner.test_options.invariant.max_assume_rejects = 1;
+    let mut runner = TEST_DATA_DEFAULT.runner_with(|config| {
+        config.invariant.runs = 1;
+        config.invariant.depth = 10;
+        config.invariant.max_assume_rejects = 1;
+    });
     let results = runner.test_collect(&filter);
     assert_multiple(
         &results,
@@ -473,7 +495,7 @@ async fn test_invariant_assume_respects_restrictions() {
             vec![(
                 "invariant_dummy()",
                 false,
-                Some("The `vm.assume` cheatcode rejected too many inputs (1 allowed)".into()),
+                Some("`vm.assume` rejected too many inputs (1 allowed)".into()),
                 None,
                 None,
             )],
@@ -484,8 +506,9 @@ async fn test_invariant_assume_respects_restrictions() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_invariant_decode_custom_error() {
     let filter = Filter::new(".*", ".*", ".*fuzz/invariant/common/InvariantCustomError.t.sol");
-    let mut runner = TEST_DATA_DEFAULT.runner();
-    runner.test_options.invariant.fail_on_revert = true;
+    let mut runner = TEST_DATA_DEFAULT.runner_with(|config| {
+        config.invariant.fail_on_revert = true;
+    });
     let results = runner.test_collect(&filter);
     assert_multiple(
         &results,
@@ -502,11 +525,12 @@ async fn test_invariant_decode_custom_error() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_invariant_fuzzed_selected_targets() {
     let filter = Filter::new(".*", ".*", ".*fuzz/invariant/target/FuzzedTargetContracts.t.sol");
-    let mut runner = TEST_DATA_DEFAULT.runner();
-    runner.test_options.invariant.fail_on_revert = true;
+    let mut runner = TEST_DATA_DEFAULT.runner_with(|config| {
+        config.invariant.fail_on_revert = true;
+    });
     let results = runner.test_collect(&filter);
     assert_multiple(
         &results,
@@ -532,9 +556,10 @@ async fn test_invariant_fuzzed_selected_targets() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_invariant_fixtures() {
     let filter = Filter::new(".*", ".*", ".*fuzz/invariant/common/InvariantFixtures.t.sol");
-    let mut runner = TEST_DATA_DEFAULT.runner();
-    runner.test_options.invariant.runs = 1;
-    runner.test_options.invariant.depth = 100;
+    let mut runner = TEST_DATA_DEFAULT.runner_with(|config| {
+        config.invariant.runs = 1;
+        config.invariant.depth = 100;
+    });
     let results = runner.test_collect(&filter);
     assert_multiple(
         &results,
@@ -585,8 +610,9 @@ async fn test_invariant_scrape_values() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_invariant_roll_fork_handler() {
     let filter = Filter::new(".*", ".*", ".*fuzz/invariant/common/InvariantRollFork.t.sol");
-    let mut runner = TEST_DATA_DEFAULT.runner();
-    runner.test_options.fuzz.seed = Some(U256::from(119u32));
+    let mut runner = TEST_DATA_DEFAULT.runner_with(|config| {
+        config.fuzz.seed = Some(U256::from(119u32));
+    });
     let results = runner.test_collect(&filter);
     assert_multiple(
         &results,
@@ -618,8 +644,9 @@ async fn test_invariant_roll_fork_handler() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_invariant_excluded_senders() {
     let filter = Filter::new(".*", ".*", ".*fuzz/invariant/common/InvariantExcludedSenders.t.sol");
-    let mut runner = TEST_DATA_DEFAULT.runner();
-    runner.test_options.invariant.fail_on_revert = true;
+    let mut runner = TEST_DATA_DEFAULT.runner_with(|config| {
+        config.invariant.fail_on_revert = true;
+    });
     let results = runner.test_collect(&filter);
     assert_multiple(
         &results,
@@ -661,30 +688,14 @@ async fn test_invariant_after_invariant() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_invariant_selectors_weight() {
-    let filter = Filter::new(".*", ".*", ".*fuzz/invariant/common/InvariantSelectorsWeight.t.sol");
-    let mut runner = TEST_DATA_DEFAULT.runner();
-    runner.test_options.fuzz.seed = Some(U256::from(119u32));
-    runner.test_options.invariant.runs = 1;
-    runner.test_options.invariant.depth = 10;
-    let results = runner.test_collect(&filter);
-    assert_multiple(
-        &results,
-        BTreeMap::from([(
-            "default/fuzz/invariant/common/InvariantSelectorsWeight.t.sol:InvariantSelectorsWeightTest",
-            vec![("invariant_selectors_weight()", true, None, None, None)],
-        )]),
-    )
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn test_no_reverts_in_counterexample() {
     let filter =
         Filter::new(".*", ".*", ".*fuzz/invariant/common/InvariantSequenceNoReverts.t.sol");
-    let mut runner = TEST_DATA_DEFAULT.runner();
-    runner.test_options.invariant.fail_on_revert = false;
-    // Use original counterexample to test sequence len.
-    runner.test_options.invariant.shrink_run_limit = 0;
+    let mut runner = TEST_DATA_DEFAULT.runner_with(|config| {
+        config.invariant.fail_on_revert = false;
+        // Use original counterexample to test sequence len.
+        config.invariant.shrink_run_limit = 0;
+    });
 
     match get_counterexample!(runner, &filter) {
         CounterExample::Single(_) => panic!("CounterExample should be a sequence."),
@@ -694,3 +705,372 @@ async fn test_no_reverts_in_counterexample() {
         }
     };
 }
+
+// Tests that a persisted failure doesn't fail due to assume revert if test driver is changed.
+forgetest_init!(should_not_fail_replay_assume, |prj, cmd| {
+    let config = Config {
+        invariant: {
+            InvariantConfig { fail_on_revert: true, max_assume_rejects: 10, ..Default::default() }
+        },
+        ..Default::default()
+    };
+    prj.write_config(config);
+
+    // Add initial test that breaks invariant.
+    prj.add_test(
+        "AssumeTest.t.sol",
+        r#"
+import {Test} from "forge-std/Test.sol";
+
+contract AssumeHandler is Test {
+    function fuzzMe(uint256 a) public {
+        require(false, "Invariant failure");
+    }
+}
+
+contract AssumeTest is Test {
+    function setUp() public {
+        AssumeHandler handler = new AssumeHandler();
+    }
+    function invariant_assume() public {}
+}
+     "#,
+    )
+    .unwrap();
+
+    cmd.args(["test", "--mt", "invariant_assume"]).assert_failure().stdout_eq(str![[r#"
+...
+[FAIL: revert: Invariant failure]
+...
+"#]]);
+
+    // Change test to use assume instead require. Same test should fail with too many inputs
+    // rejected message instead persisted failure revert.
+    prj.add_test(
+        "AssumeTest.t.sol",
+        r#"
+import {Test} from "forge-std/Test.sol";
+
+contract AssumeHandler is Test {
+    function fuzzMe(uint256 a) public {
+        vm.assume(false);
+    }
+}
+
+contract AssumeTest is Test {
+    function setUp() public {
+        AssumeHandler handler = new AssumeHandler();
+    }
+    function invariant_assume() public {}
+}
+     "#,
+    )
+    .unwrap();
+
+    cmd.assert_failure().stdout_eq(str![[r#"
+...
+[FAIL: `vm.assume` rejected too many inputs (10 allowed)] invariant_assume() (runs: 0, calls: 0, reverts: 0)
+...
+"#]]);
+});
+
+// Test too many inputs rejected for `assumePrecompile`/`assumeForgeAddress`.
+// <https://github.com/foundry-rs/foundry/issues/9054>
+forgetest_init!(should_revert_with_assume_code, |prj, cmd| {
+    let config = Config {
+        optimizer: Some(true),
+        invariant: {
+            InvariantConfig { fail_on_revert: true, max_assume_rejects: 10, ..Default::default() }
+        },
+        ..Default::default()
+    };
+    prj.write_config(config);
+
+    // Add initial test that breaks invariant.
+    prj.add_test(
+        "AssumeTest.t.sol",
+        r#"
+import {Test} from "forge-std/Test.sol";
+
+contract BalanceTestHandler is Test {
+    address public ref = address(1412323);
+    address alice;
+
+    constructor(address _alice) {
+        alice = _alice;
+    }
+
+    function increment(uint256 amount_, address addr) public {
+        assumeNotPrecompile(addr);
+        assumeNotForgeAddress(addr);
+        assertEq(alice.balance, 100_000 ether);
+    }
+}
+
+contract BalanceAssumeTest is Test {
+    function setUp() public {
+        address alice = makeAddr("alice");
+        vm.deal(alice, 100_000 ether);
+        targetSender(alice);
+        BalanceTestHandler handler = new BalanceTestHandler(alice);
+        targetContract(address(handler));
+    }
+
+    function invariant_balance() public {}
+}
+     "#,
+    )
+    .unwrap();
+
+    cmd.args(["test", "--mt", "invariant_balance"]).assert_failure().stdout_eq(str![[r#"
+...
+[FAIL: `vm.assume` rejected too many inputs (10 allowed)] invariant_balance() (runs: 0, calls: 0, reverts: 0)
+...
+"#]]);
+});
+
+// Test proper message displayed if `targetSelector`/`excludeSelector` called with empty selectors.
+// <https://github.com/foundry-rs/foundry/issues/9066>
+forgetest_init!(should_not_panic_if_no_selectors, |prj, cmd| {
+    prj.add_test(
+        "NoSelectorTest.t.sol",
+        r#"
+import {Test} from "forge-std/Test.sol";
+
+contract TestHandler is Test {}
+
+contract NoSelectorTest is Test {
+    bytes4[] selectors;
+
+    function setUp() public {
+        TestHandler handler = new TestHandler();
+        targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
+        excludeSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
+    }
+
+    function invariant_panic() public {}
+}
+     "#,
+    )
+    .unwrap();
+
+    cmd.args(["test", "--mt", "invariant_panic"]).assert_failure().stdout_eq(str![[r#"
+...
+[FAIL: failed to set up invariant testing environment: No contracts to fuzz.] invariant_panic() (runs: 0, calls: 0, reverts: 0)
+...
+"#]]);
+});
+
+// <https://github.com/foundry-rs/foundry/issues/3607>
+forgetest_init!(should_show_invariant_metrics, |prj, cmd| {
+    prj.add_test(
+        "SelectorMetricsTest.t.sol",
+        r#"
+import {Test} from "forge-std/Test.sol";
+
+contract CounterTest is Test {
+    function setUp() public {
+        CounterHandler handler = new CounterHandler();
+        AnotherCounterHandler handler1 = new AnotherCounterHandler();
+        // targetContract(address(handler1));
+    }
+
+    /// forge-config: default.invariant.runs = 10
+    /// forge-config: default.invariant.show-metrics = true
+    function invariant_counter() public {}
+
+    /// forge-config: default.invariant.runs = 10
+    /// forge-config: default.invariant.show-metrics = true
+    function invariant_counter2() public {}
+}
+
+contract CounterHandler is Test {
+    function doSomething(uint256 a) public {
+        vm.assume(a < 10_000_000);
+        require(a < 100_000);
+    }
+
+    function doAnotherThing(uint256 a) public {
+        vm.assume(a < 10_000_000);
+        require(a < 100_000);
+    }
+}
+
+contract AnotherCounterHandler is Test {
+    function doWork(uint256 a) public {
+        vm.assume(a < 10_000_000);
+        require(a < 100_000);
+    }
+
+    function doWorkThing(uint256 a) public {
+        vm.assume(a < 10_000_000);
+        require(a < 100_000);
+    }
+}
+     "#,
+    )
+    .unwrap();
+
+    cmd.args(["test", "--mt", "invariant_"]).assert_success().stdout_eq(str![[r#"
+...
+[PASS] invariant_counter() (runs: 10, calls: 5000, reverts: [..])
+
+╭-----------------------+----------------+-------+---------+----------╮
+| Contract              | Selector       | Calls | Reverts | Discards |
++=====================================================================+
+| AnotherCounterHandler | doWork         | [..]  | [..]    | [..]     |
+|-----------------------+----------------+-------+---------+----------|
+| AnotherCounterHandler | doWorkThing    | [..]  | [..]    | [..]     |
+|-----------------------+----------------+-------+---------+----------|
+| CounterHandler        | doAnotherThing | [..]  | [..]    | [..]     |
+|-----------------------+----------------+-------+---------+----------|
+| CounterHandler        | doSomething    | [..]  | [..]    | [..]     |
+╰-----------------------+----------------+-------+---------+----------╯
+
+[PASS] invariant_counter2() (runs: 10, calls: 5000, reverts: [..])
+
+╭-----------------------+----------------+-------+---------+----------╮
+| Contract              | Selector       | Calls | Reverts | Discards |
++=====================================================================+
+| AnotherCounterHandler | doWork         | [..]  | [..]    | [..]     |
+|-----------------------+----------------+-------+---------+----------|
+| AnotherCounterHandler | doWorkThing    | [..]  | [..]    | [..]     |
+|-----------------------+----------------+-------+---------+----------|
+| CounterHandler        | doAnotherThing | [..]  | [..]    | [..]     |
+|-----------------------+----------------+-------+---------+----------|
+| CounterHandler        | doSomething    | [..]  | [..]    | [..]     |
+╰-----------------------+----------------+-------+---------+----------╯
+
+Suite result: ok. 2 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 2 tests passed, 0 failed, 0 skipped (2 total tests)
+
+"#]]);
+});
+
+// Tests that invariant exists with success after configured timeout.
+forgetest_init!(should_apply_configured_timeout, |prj, cmd| {
+    // Add initial test that breaks invariant.
+    prj.add_test(
+        "TimeoutTest.t.sol",
+        r#"
+import {Test} from "forge-std/Test.sol";
+
+contract TimeoutHandler is Test {
+    uint256 public count;
+
+    function increment() public {
+        count++;
+    }
+}
+
+contract TimeoutTest is Test {
+    TimeoutHandler handler;
+
+    function setUp() public {
+        handler = new TimeoutHandler();
+    }
+
+    /// forge-config: default.invariant.runs = 10000
+    /// forge-config: default.invariant.depth = 20000
+    /// forge-config: default.invariant.timeout = 1
+    function invariant_counter_timeout() public view {
+        // Invariant will fail if more than 10000 increments.
+        // Make sure test timeouts after one second and remaining runs are canceled.
+        require(handler.count() < 10000);
+    }
+}
+     "#,
+    )
+    .unwrap();
+
+    cmd.args(["test", "--mt", "invariant_counter_timeout"]).assert_success().stdout_eq(str![[r#"
+[COMPILING_FILES] with [SOLC_VERSION]
+[SOLC_VERSION] [ELAPSED]
+Compiler run successful!
+
+Ran 1 test for test/TimeoutTest.t.sol:TimeoutTest
+[PASS] invariant_counter_timeout() (runs: 0, calls: 0, reverts: 0)
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
+
+"#]]);
+});
+
+// Tests that selector hits are uniformly distributed
+// <https://github.com/foundry-rs/foundry/issues/2986>
+forgetest_init!(invariant_selectors_weight, |prj, cmd| {
+    prj.write_config(Config {
+        optimizer: Some(true),
+        invariant: { InvariantConfig { runs: 1, depth: 10, ..Default::default() } },
+        ..Default::default()
+    });
+    prj.add_source(
+        "InvariantHandlers.sol",
+        r#"
+contract HandlerOne {
+    uint256 public hit1;
+
+    function selector1() external {
+        hit1 += 1;
+    }
+}
+
+contract HandlerTwo {
+    uint256 public hit2;
+    uint256 public hit3;
+    uint256 public hit4;
+    uint256 public hit5;
+
+    function selector2() external {
+        hit2 += 1;
+    }
+
+    function selector3() external {
+        hit3 += 1;
+    }
+
+    function selector4() external {
+        hit4 += 1;
+    }
+
+    function selector5() external {
+        hit5 += 1;
+    }
+}
+   "#,
+    )
+    .unwrap();
+
+    prj.add_test(
+        "InvariantSelectorsWeightTest.t.sol",
+        r#"
+import {Test} from "forge-std/Test.sol";
+import "src/InvariantHandlers.sol";
+
+contract InvariantSelectorsWeightTest is Test {
+    HandlerOne handlerOne;
+    HandlerTwo handlerTwo;
+
+    function setUp() public {
+        handlerOne = new HandlerOne();
+        handlerTwo = new HandlerTwo();
+    }
+
+    function afterInvariant() public {
+        assertEq(handlerOne.hit1(), 2);
+        assertEq(handlerTwo.hit2(), 2);
+        assertEq(handlerTwo.hit3(), 3);
+        assertEq(handlerTwo.hit4(), 1);
+        assertEq(handlerTwo.hit5(), 2);
+    }
+
+    function invariant_selectors_weight() public view {}
+}
+   "#,
+    )
+    .unwrap();
+
+    cmd.args(["test", "--fuzz-seed", "119", "--mt", "invariant_selectors_weight"]).assert_success();
+});

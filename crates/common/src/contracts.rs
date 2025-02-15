@@ -115,24 +115,26 @@ impl ContractsByArtifact {
 
     /// Finds a contract which has a similar bytecode as `code`.
     pub fn find_by_creation_code(&self, code: &[u8]) -> Option<ArtifactWithContractRef<'_>> {
-        self.find_by_code(code, ContractData::bytecode)
+        self.find_by_code(code, 0.1, ContractData::bytecode)
     }
 
     /// Finds a contract which has a similar deployed bytecode as `code`.
     pub fn find_by_deployed_code(&self, code: &[u8]) -> Option<ArtifactWithContractRef<'_>> {
-        self.find_by_code(code, ContractData::deployed_bytecode)
+        self.find_by_code(code, 0.15, ContractData::deployed_bytecode)
     }
 
+    /// Finds a contract based on provided bytecode and accepted match score.
     fn find_by_code(
         &self,
         code: &[u8],
+        accepted_score: f64,
         get: impl Fn(&ContractData) -> Option<&Bytes>,
     ) -> Option<ArtifactWithContractRef<'_>> {
         self.iter()
             .filter_map(|(id, contract)| {
                 if let Some(deployed_bytecode) = get(contract) {
                     let score = bytecode_diff_score(deployed_bytecode.as_ref(), code);
-                    (score <= 0.1).then_some((score, (id, contract)))
+                    (score <= accepted_score).then_some((score, (id, contract)))
                 } else {
                     None
                 }
@@ -257,6 +259,15 @@ impl ContractsByArtifact {
         Ok(contracts.first().cloned())
     }
 
+    /// Finds abi for contract which has the same contract name or identifier as `id`.
+    pub fn find_abi_by_name_or_identifier(&self, id: &str) -> Option<JsonAbi> {
+        self.iter()
+            .find(|(artifact, _)| {
+                artifact.name.split(".").next().unwrap() == id || artifact.identifier() == id
+            })
+            .map(|(_, contract)| contract.abi.clone())
+    }
+
     /// Flattens the contracts into functions, events and errors.
     pub fn flatten(&self) -> (BTreeMap<Selector, Function>, BTreeMap<B256, Event>, JsonAbi) {
         let mut funcs = BTreeMap::new();
@@ -339,6 +350,8 @@ unsafe fn count_different_bytes(a: &[u8], b: &[u8]) -> usize {
     sum
 }
 
+/// Returns contract name for a given contract identifier.
+///
 /// Artifact/Contract identifier can take the following form:
 /// `<artifact file name>:<contract name>`, the `artifact file name` is the name of the json file of
 /// the contract's artifact and the contract name is the name of the solidity contract, like

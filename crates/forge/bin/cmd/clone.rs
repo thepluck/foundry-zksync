@@ -7,7 +7,10 @@ use foundry_block_explorers::{
     errors::EtherscanError,
     Client,
 };
-use foundry_cli::{opts::EtherscanOpts, p_println, utils::Git};
+use foundry_cli::{
+    opts::EtherscanOpts,
+    utils::{Git, LoadConfig},
+};
 use foundry_common::{compile::ProjectCompiler, fs};
 use foundry_compilers::{
     artifacts::{
@@ -87,26 +90,27 @@ pub struct CloneArgs {
     pub etherscan: EtherscanOpts,
 
     #[command(flatten)]
-    pub opts: DependencyInstallOpts,
+    pub install: DependencyInstallOpts,
 }
 
 impl CloneArgs {
     pub async fn run(self) -> Result<()> {
-        let Self { address, root, opts, etherscan, no_remappings_txt, keep_directory_structure } =
+        let Self { address, root, install, etherscan, no_remappings_txt, keep_directory_structure } =
             self;
 
         // step 0. get the chain and api key from the config
-        let config = Config::from(&etherscan);
+        let config = etherscan.load_config()?;
         let chain = config.chain.unwrap_or_default();
         let etherscan_api_key = config.get_etherscan_api_key(Some(chain)).unwrap_or_default();
         let client = Client::new(chain, etherscan_api_key.clone())?;
 
         // step 1. get the metadata from client
-        p_println!(!opts.quiet => "Downloading the source code of {} from Etherscan...", address);
+        sh_println!("Downloading the source code of {address} from Etherscan...")?;
+
         let meta = Self::collect_metadata_from_client(address, &client).await?;
 
         // step 2. initialize an empty project
-        Self::init_an_empty_project(&root, opts)?;
+        Self::init_an_empty_project(&root, install)?;
         // canonicalize the root path
         // note that at this point, the root directory must have been created
         let root = dunce::canonicalize(&root)?;
@@ -117,17 +121,17 @@ impl CloneArgs {
 
         // step 4. collect the compilation metadata
         // if the etherscan api key is not set, we need to wait for 3 seconds between calls
-        p_println!(!opts.quiet => "Collecting the creation information of {} from Etherscan...", address);
+        sh_println!("Collecting the creation information of {address} from Etherscan...")?;
+
         if etherscan_api_key.is_empty() {
-            p_println!(!opts.quiet => "Waiting for 5 seconds to avoid rate limit...");
+            sh_warn!("Waiting for 5 seconds to avoid rate limit...")?;
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
-        Self::collect_compilation_metadata(&meta, chain, address, &root, &client, opts.quiet)
-            .await?;
+        Self::collect_compilation_metadata(&meta, chain, address, &root, &client).await?;
 
         // step 5. git add and commit the changes if needed
-        if !opts.no_commit {
-            let git = Git::new(&root).quiet(opts.quiet);
+        if !install.no_commit {
+            let git = Git::new(&root);
             git.add(Some("--all"))?;
             let msg = format!("chore: forge clone {address}");
             git.commit(&msg)?;
@@ -156,9 +160,9 @@ impl CloneArgs {
     /// * `root` - the root directory of the project.
     /// * `enable_git` - whether to enable git for the project.
     /// * `quiet` - whether to print messages.
-    pub(crate) fn init_an_empty_project(root: &Path, opts: DependencyInstallOpts) -> Result<()> {
+    pub(crate) fn init_an_empty_project(root: &Path, install: DependencyInstallOpts) -> Result<()> {
         // let's try to init the project with default init args
-        let init_args = InitArgs { root: root.to_path_buf(), opts, ..Default::default() };
+        let init_args = InitArgs { root: root.to_path_buf(), install, ..Default::default() };
         init_args.run().map_err(|e| eyre::eyre!("Project init error: {:?}", e))?;
 
         // remove the unnecessary example contracts
@@ -185,10 +189,9 @@ impl CloneArgs {
         address: Address,
         root: &PathBuf,
         client: &C,
-        quiet: bool,
     ) -> Result<()> {
         // compile the cloned contract
-        let compile_output = compile_project(root, quiet)?;
+        let compile_output = compile_project(root)?;
         let (main_file, main_artifact) = find_main_contract(&compile_output, &meta.contract_name)?;
         let main_file = main_file.strip_prefix(root)?.to_path_buf();
         let storage_layout =
@@ -266,7 +269,7 @@ impl CloneArgs {
                 let remappings_txt_content =
                     config.remappings.iter().map(|r| r.to_string()).collect::<Vec<_>>().join("\n");
                 if fs::write(&remappings_txt, remappings_txt_content).is_err() {
-                    return false
+                    return false;
                 }
 
                 let profile = config.profile.as_str().as_str();
@@ -547,11 +550,11 @@ fn dump_sources(meta: &Metadata, root: &PathBuf, no_reorg: bool) -> Result<Vec<R
 }
 
 /// Compile the project in the root directory, and return the compilation result.
-pub fn compile_project(root: &PathBuf, quiet: bool) -> Result<ProjectCompileOutput> {
-    let mut config = Config::load_with_root(root).sanitized();
+pub fn compile_project(root: &Path) -> Result<ProjectCompileOutput> {
+    let mut config = Config::load_with_root(root)?.sanitized();
     config.extra_output.push(ContractOutputSelection::StorageLayout);
     let project = config.project()?;
-    let compiler = ProjectCompiler::new().quiet_if(quiet);
+    let compiler = ProjectCompiler::new();
     compiler.compile(&project)
 }
 
@@ -576,11 +579,9 @@ pub fn find_main_contract<'a>(
     rv.ok_or_else(|| eyre::eyre!("contract not found"))
 }
 
-#[cfg(test)]
-use mockall::automock;
 /// EtherscanClient is a trait that defines the methods to interact with Etherscan.
 /// It is defined as a wrapper of the `foundry_block_explorers::Client` to allow mocking.
-#[cfg_attr(test, automock)]
+#[cfg_attr(test, mockall::automock)]
 pub(crate) trait EtherscanClient {
     async fn contract_source_code(
         &self,
@@ -611,16 +612,18 @@ impl EtherscanClient for Client {
 }
 
 #[cfg(test)]
+#[allow(clippy::needless_return)]
 mod tests {
     use super::*;
     use alloy_primitives::hex;
-    use foundry_compilers::Artifact;
-    use foundry_test_utils::rpc::next_etherscan_api_key;
+    use foundry_compilers::CompilerContract;
+    use foundry_test_utils::rpc::next_mainnet_etherscan_api_key;
     use std::collections::BTreeMap;
 
+    #[allow(clippy::disallowed_macros)]
     fn assert_successful_compilation(root: &PathBuf) -> ProjectCompileOutput {
         println!("project_root: {root:#?}");
-        compile_project(root, false).expect("compilation failure")
+        compile_project(root).expect("compilation failure")
     }
 
     fn assert_compilation_result(
@@ -632,7 +635,7 @@ mod tests {
             contracts.iter().for_each(|(name, contract)| {
                 if name == contract_name {
                     let compiled_creation_code =
-                        contract.get_bytecode_object().expect("creation code not found");
+                        contract.bin_ref().expect("creation code not found");
                     assert!(
                         hex::encode(compiled_creation_code.as_ref())
                             .starts_with(stripped_creation_code),
@@ -693,7 +696,7 @@ mod tests {
         // create folder if not exists
         std::fs::create_dir_all(&data_folder).unwrap();
         // create metadata.json and creation_data.json
-        let client = Client::new(Chain::mainnet(), next_etherscan_api_key()).unwrap();
+        let client = Client::new(Chain::mainnet(), next_mainnet_etherscan_api_key()).unwrap();
         let meta = client.contract_source_code(address).await.unwrap();
         // dump json
         let json = serde_json::to_string_pretty(&meta).unwrap();
@@ -722,7 +725,6 @@ mod tests {
             address,
             &project_root,
             &client,
-            false,
         )
         .await
         .unwrap();

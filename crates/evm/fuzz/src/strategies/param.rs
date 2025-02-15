@@ -2,6 +2,7 @@ use super::state::EvmFuzzState;
 use alloy_dyn_abi::{DynSolType, DynSolValue};
 use alloy_primitives::{Address, B256, I256, U256};
 use proptest::prelude::*;
+use rand::{rngs::StdRng, SeedableRng};
 
 /// The max length of arrays we fuzz for is 256.
 const MAX_ARRAY_LEN: usize = 256;
@@ -17,9 +18,10 @@ pub fn fuzz_param(
 }
 
 /// Given a parameter type and configured fixtures for param name, returns a strategy for generating
-/// values for that type. Fixtures can be currently generated for uint, int, address, bytes and
-/// string types and are defined for parameter name.
+/// values for that type.
 ///
+/// Fixtures can be currently generated for uint, int, address, bytes and
+/// string types and are defined for parameter name.
 /// For example, fixtures for parameter `owner` of type `address` can be defined in a function with
 /// a `function fixture_owner() public returns (address[] memory)` signature.
 ///
@@ -148,16 +150,37 @@ pub fn fuzz_param_from_state(
 
     // Convert the value based on the parameter type
     match *param {
-        DynSolType::Address => value()
-            .prop_map(move |value| {
-                let addr = Address::from_word(value);
-                if no_zksync_reserved_addresses {
-                    DynSolValue::Address(foundry_zksync_core::to_safe_address(addr))
-                } else {
-                    DynSolValue::Address(addr)
-                }
-            })
-            .boxed(),
+        DynSolType::Address => {
+            let deployed_libs = state.deployed_libs.clone();
+            value()
+                .prop_map(move |value| {
+                    let mut fuzzed_addr = Address::from_word(value);
+                    if !deployed_libs.contains(&fuzzed_addr) {
+                        if no_zksync_reserved_addresses {
+                            DynSolValue::Address(foundry_zksync_core::to_safe_address(fuzzed_addr))
+                        } else {
+                            DynSolValue::Address(fuzzed_addr)
+                        }
+                    } else {
+                        let mut rng = StdRng::seed_from_u64(0x1337); // use deterministic rng
+
+                        // Do not use addresses of deployed libraries as fuzz input, instead return
+                        // a deterministically random address. We cannot filter out this value (via
+                        // `prop_filter_map`) as proptest can invoke this closure after test
+                        // execution, and returning a `None` will cause it to panic.
+                        // See <https://github.com/foundry-rs/foundry/issues/9764> and <https://github.com/foundry-rs/foundry/issues/8639>.
+                        loop {
+                            fuzzed_addr.randomize_with(&mut rng);
+                            if !deployed_libs.contains(&fuzzed_addr) {
+                                break;
+                            }
+                        }
+
+                        DynSolValue::Address(fuzzed_addr)
+                    }
+                })
+                .boxed()
+        }
         DynSolType::Function => value()
             .prop_map(move |value| {
                 DynSolValue::Function(alloy_primitives::Function::from_word(value))
@@ -243,13 +266,13 @@ mod tests {
         let f = "testArray(uint64[2] calldata values)";
         let func = get_func(f).unwrap();
         let db = CacheDB::new(EmptyDB::default());
-        let state = EvmFuzzState::new(&db, FuzzDictionaryConfig::default(), false);
-        let strat = proptest::prop_oneof![
+        let state = EvmFuzzState::new(&db, FuzzDictionaryConfig::default(), &[], false);
+        let strategy = proptest::prop_oneof![
             60 => fuzz_calldata(func.clone(), &FuzzFixtures::default(), false),
             40 => fuzz_calldata_from_state(func, &state),
         ];
         let cfg = proptest::test_runner::Config { failure_persistence: None, ..Default::default() };
         let mut runner = proptest::test_runner::TestRunner::new(cfg);
-        let _ = runner.run(&strat, |_| Ok(()));
+        let _ = runner.run(&strategy, |_| Ok(()));
     }
 }
